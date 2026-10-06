@@ -1,5 +1,6 @@
 #include "netif_ap.h"
 #include "settings.h"
+#include "captive.h"
 
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -20,6 +21,37 @@ static const char *TAG = "netif_ap";
 
 static esp_netif_t *s_ap = NULL;
 static char s_ssid[SETT_SSID_MAX];
+
+static void configure_dhcp_portal(void)
+{
+    /* DHCP 选项只能在服务停止时修改。此前把 IP 地址本身传给
+       ESP_NETIF_DOMAIN_NAME_SERVER（该选项实际只接收 1 字节开关），调用会失败。 */
+    esp_err_t err = esp_netif_dhcps_stop(s_ap);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_LOGW(TAG, "stop DHCP server failed: %s", esp_err_to_name(err));
+    }
+
+    esp_netif_dns_info_t dns = { 0 };
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = esp_ip4addr_aton("192.168.4.1");
+    err = esp_netif_set_dns_info(s_ap, ESP_NETIF_DNS_MAIN, &dns);
+    if (err != ESP_OK) ESP_LOGW(TAG, "set DHCP DNS failed: %s", esp_err_to_name(err));
+
+    uint8_t dns_offer = 1;
+    err = esp_netif_dhcps_option(s_ap, ESP_NETIF_OP_SET,
+                                 ESP_NETIF_DOMAIN_NAME_SERVER,
+                                 &dns_offer, sizeof(dns_offer));
+    if (err != ESP_OK) ESP_LOGW(TAG, "enable DHCP DNS offer failed: %s", esp_err_to_name(err));
+
+    /* 不下发 DHCP Option 114。该选项必须指向带可信 TLS 证书的 RFC 8908 JSON API，
+       不能直接填写本机 HTTP 页面；错误下发会让 iOS 识别到无网络却不打开门户。
+       纯离线 ESP32 热点继续使用兼容性更广的 DNS 劫持 + HTTP 探测重定向。 */
+
+    err = esp_netif_dhcps_start(s_ap);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+        ESP_LOGW(TAG, "start DHCP server failed: %s", esp_err_to_name(err));
+    }
+}
 
 void netif_ap_apply_tx_power(void)
 {
@@ -50,6 +82,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *e = (wifi_event_ap_stadisconnected_t *)data;
         ESP_LOGI(TAG, "station " MACSTR " left", MAC2STR(e->mac));
+        captive_apple_station_disconnected();
     }
 }
 
@@ -108,10 +141,7 @@ void netif_ap_apply(void)
 
     netif_ap_apply_tx_power();
 
-    /* DHCP 下发 DNS = 网关自身，captive portal 探测更快命中。 */
-    uint32_t dns = esp_ip4addr_aton("192.168.4.1");
-    esp_netif_dhcps_option(s_ap, ESP_NETIF_OP_SET,
-                           ESP_NETIF_DOMAIN_NAME_SERVER, &dns, sizeof(dns));
+    configure_dhcp_portal();
 
     ESP_LOGI(TAG, "SoftAP '%s' up (open=%d, max %d)",
              s_ssid, s->ap_pass[0] == 0, AP_MAX_CONN);

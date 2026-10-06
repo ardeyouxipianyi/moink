@@ -29,7 +29,7 @@
 #define SETT_WAKE_12H     43200
 #define SETT_WAKE_1D      86400
 
-/* WiFi 发射功率档位。高 = 18dBm（默认）；中 = 10dBm；低 = 8.5dBm（缺陷批次救急档）。 */
+/* WiFi 发射功率档位。高 = 18dBm；中 = 10dBm（默认）；低 = 8.5dBm（缺陷批次救急档）。 */
 #define SETT_WIFI_PWR_HIGH  0
 #define SETT_WIFI_PWR_MID   1
 #define SETT_WIFI_PWR_LOW   2

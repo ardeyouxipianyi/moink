@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="moink-page-version" content="R1.2.0">
+<meta name="moink-page-version" content="R1.2.1">
 <title>墨印 · MoInk</title>
 <style>
 /* ===== Cropper.js v1.6.2 | MIT | https://github.com/fengyuanchen/cropperjs ===== */
@@ -96,10 +96,17 @@ input[type=text],input[type=password],input[type=number],select,textarea{
 textarea{ width:100%; min-height:84px; resize:vertical; }
 input[type=range]{ flex:1; min-width:120px; }
 input[type=file]{ font-size:13px; }
-#drop{ border:2px dashed var(--line); border-radius:14px; padding:26px 16px; text-align:center;
-       color:var(--mut); cursor:pointer; }
+#drop{ position:relative; overflow:hidden; border:2px dashed var(--line); border-radius:14px;
+       padding:26px 16px; text-align:center; color:var(--mut); cursor:pointer; }
 #drop.has{ border-style:solid; border-color:#d9cfbf; }
+#file{ position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:pointer; }
 #filerow{ display:flex; align-items:center; gap:10px; margin-top:10px; }
+#refile{ display:inline-block; background:#f1ece1; color:var(--ink); border-radius:10px;
+         padding:7px 12px; font-size:13px; cursor:pointer; white-space:nowrap; }
+#browserFallback{ display:none; }
+#browserFallback.show{ display:block; }
+#openBrowser{ display:block; margin:8px 0 0; border-radius:10px; padding:9px 12px;
+              background:var(--acc2); color:#fff; text-align:center; text-decoration:none; font-size:13px; }
 #thumb{ width:56px; height:40px; object-fit:cover; border-radius:8px; border:1px solid var(--line); }
 #fname{ font-size:12px; color:var(--mut); flex:1; word-break:break-all; }
 #cropWrap{ margin:10px 0; border-radius:12px; overflow:hidden; background:#eee6da; }
@@ -134,6 +141,21 @@ input[type=file]{ font-size:13px; }
 #stathint{ font-size:12px; color:var(--mut); text-align:center; margin:4px 0; }
 #msg{ margin:10px 0 0; font-size:13.5px; min-height:20px; }
 #msg.ok{ color:var(--ok); } #msg.err{ color:var(--err); }
+body.workLocked{ overflow:hidden; touch-action:none; }
+body.workLocked > :not(#workLoading){ pointer-events:none!important; user-select:none; }
+#workLoading{ position:fixed; top:0; right:0; bottom:0; left:0; width:100vw; height:100vh;
+              z-index:2147483647; display:none; align-items:center; justify-content:center;
+              background:rgba(247,243,234,.9); -webkit-backdrop-filter:blur(2px);
+              backdrop-filter:blur(2px); pointer-events:none; touch-action:none; }
+#workLoading.show{ display:flex; pointer-events:auto; }
+#workLoading .box{ min-width:180px; max-width:80vw; padding:18px 22px; border:1px solid var(--line);
+                   border-radius:14px; background:#fff; box-shadow:0 8px 30px rgba(75,55,30,.16);
+                   display:flex; align-items:center; justify-content:center; gap:12px;
+                   color:var(--ink); font-size:14px; font-weight:600; }
+#workLoading .spin{ width:20px; height:20px; flex:none; border:3px solid #eadfce;
+                    border-top-color:var(--acc); border-radius:50%; animation:workSpin .8s linear infinite; }
+@keyframes workSpin{ to{ transform:rotate(360deg); } }
+@media (prefers-reduced-motion:reduce){ #workLoading .spin{ animation:none; } }
 /* R1.1.3（FB-014）：设置项就地保存状态 —— 保存成功/失败都必须看得见。 */
 .savestate{ display:inline-flex; align-items:center; margin:0; padding:3px 9px;
             border-radius:99px; font-size:12.5px; font-weight:700; line-height:1.35; }
@@ -160,6 +182,10 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
 </style>
 </head>
 <body>
+
+<div id="workLoading" aria-hidden="true">
+  <div class="box" role="status" aria-live="polite"><span class="spin"></span><span id="workLoadingText">正在处理…</span></div>
+</div>
 
 <header>
   <div id="hdrL">
@@ -193,12 +219,17 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
 
     <div id="editorGrid"><div id="editLeft">
     <div id="pickCard">
-      <div id="drop"><b>点击选择图片</b><br><span style="font-size:12px">也可以拖入，或直接粘贴</span></div>
-      <input type="file" id="file" accept="image/*" style="display:none">
+      <div id="drop"><b>点击选择图片</b><br><span style="font-size:12px">也可以拖入，或直接粘贴</span>
+        <input type="file" id="file" accept="image/*" aria-label="选择图片">
+      </div>
+      <div id="browserFallback">
+        <div class="hint">当前弹出页无法选择照片，请转到系统自带浏览器打开192.168.4.1继续。</div>
+        <a id="openBrowser" href="intent://192.168.4.1/#Intent;scheme=http;action=android.intent.action.VIEW;category=android.intent.category.BROWSABLE;S.browser_fallback_url=http%3A%2F%2F192.168.4.1%2F;end">在系统浏览器中选择照片</a>
+      </div>
       <div id="filerow" style="display:none">
         <img id="thumb" alt="">
         <span id="fname"></span>
-        <button class="mini" id="refile">换图</button>
+        <label id="refile" for="file">换图</label>
       </div>
 
       <div id="cropCard">
@@ -275,7 +306,7 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
           <label><input type="checkbox" id="textOn"> 添加文字</label>
         </div>
         <div id="textPanel" style="display:none">
-          <textarea id="txt" placeholder="输入文字，点「＋ 添加」上屏；选中文字框后可在此直接修改"></textarea>
+          <textarea id="txt" autocomplete="off" placeholder="输入文字，点「＋ 添加」上屏；选中文字框后可在此直接修改"></textarea>
           <div class="row">
             <button class="mini" id="objAdd">＋ 添加</button>
             <button class="mini" id="objDel">删除所选</button>
@@ -375,8 +406,8 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
     <div class="row">
       <label>WiFi 功率</label>
       <select id="wifiPwrSel">
-        <option value="0">高（18dBm，默认）</option>
-        <option value="1">中（10dBm）</option>
+        <option value="0">高（18dBm）</option>
+        <option value="1">中（10dBm，默认）</option>
         <option value="2">低（8.5dBm）</option>
       </select>
       <span class="hint" style="margin:0">连不上/传输不稳时再调低</span>
@@ -1089,6 +1120,8 @@ function renderBase(cw, ch){
 function liveDraw(){
   liveRaf = 0;
   if (!liveBase) return;
+  /* 指针事件可能高于屏幕刷新率；DOM 几何与画布统一在 RAF 中各更新一次。 */
+  if (od) relayoutOne(od.i, od.act === "m" || od.act === "r");
   var ctx = prevEl.getContext("2d");
   ctx.putImageData(liveBase, 0, 0);
   drawObjs(ctx, (MODE === 0 && !cfg.textOn) ? [] : curObjs(), prevEl.width, prevEl.height);  /* R1.0.17 */
@@ -1173,6 +1206,26 @@ var cropImgEl = $("cropImg"), objLayerEl = $("objLayer"), prevWrapEl = $("prevWr
 var prevEl = $("prev"), goEl = $("go"), msgEl = $("msg");
 var barEl = $("bar"), fillEl = $("fill"), statHintEl = $("stathint");
 var dropEl = $("drop"), txtEl = $("txt");
+var workLoadingEl = $("workLoading"), workLoadingTextEl = $("workLoadingText");
+
+function showWorkLoading(text){
+  workLoadingTextEl.textContent = text || "正在处理…";
+  workLoadingEl.classList.add("show");
+  document.body.classList.add("workLocked");
+  workLoadingEl.setAttribute("aria-hidden", "false");
+}
+function updateWorkLoading(text){ workLoadingTextEl.textContent = text; }
+function hideWorkLoading(){
+  workLoadingEl.classList.remove("show");
+  document.body.classList.remove("workLocked");
+  workLoadingEl.setAttribute("aria-hidden", "true");
+}
+/* 同步 Canvas 计算会占满主线程；跨过两个动画帧，确保 loading 已经真正绘制到屏幕。 */
+function afterLoadingPaint(fn){
+  requestAnimationFrame(function(){ requestAnimationFrame(fn); });
+}
+
+var captivePage = /(?:^|[?&])moink_captive=1(?:&|$)/.test(location.search);
 
 var cfg = Object.assign({}, DEF);
 var img = null;
@@ -1190,7 +1243,15 @@ var LS_KEY_OLD = "einkframe.cfg4";
 /* FB-005：saveCfg 节流（前沿 + 300ms 拖尾）。滑杆拖动等高频调用不再逐次写
    localStorage，最后一次改动保证落盘；调用点保持原样无需改动。 */
 var _saveLast = 0, _saveTmr = null;
-function _saveNow(){ try { localStorage.setItem(LS_KEY, JSON.stringify(cfg)); _saveLast = Date.now(); } catch(e){} }
+function _saveNow(){
+  try {
+    /* 文字框仅属于当前编辑会话，刷新或重新打开页面时从空白开始。 */
+    var stored = Object.assign({}, cfg);
+    delete stored.objsImg; delete stored.objsNote; delete stored.text;
+    localStorage.setItem(LS_KEY, JSON.stringify(stored));
+    _saveLast = Date.now();
+  } catch(e){}
+}
 function saveCfg(){
   if (_saveTmr){ clearTimeout(_saveTmr); _saveTmr = null; }
   var gap = Date.now() - _saveLast;
@@ -1225,6 +1286,10 @@ function loadCfg(){
   }
   cfg.objsImg = normObjs(cfg.objsImg);
   cfg.objsNote = normObjs(cfg.objsNote);
+  /* 旧版本曾把文字框写入 localStorage；载入后清掉，避免再次打开仍显示上次内容。 */
+  cfg.objsImg = [];
+  cfg.objsNote = [];
+  cfg.text = "";
   /* R1.0.16 竖屏化一次性迁移：旧横屏坐标(768x552)逆时针映射到竖屏(552x768)，
      保证设备输出不变（rotateCW(新) === 旧）；m16rot 防重入 */
   if (!cfg.m16rot){
@@ -1251,9 +1316,16 @@ function loadCfg(){
 function preview(){
   if (previewBusy || !previewWant) return;
   if (MODE === 0 && !img){ previewWant = null; return; }
+  previewBusy = true;
+  runPreview();
+}
+function runPreview(){
+  if (!previewWant){
+    previewBusy = false;
+    return;
+  }
   var fast = (previewWant === "fast");
   previewWant = null;
-  previewBusy = true;
   try {
     var div = fast ? 2 : 1;
     renderTo(prevEl, Math.round(EW/div), Math.round(EH/div));
@@ -1281,10 +1353,19 @@ function schedulePreview(fast){
   previewWant = "full";
   previewTimer = setTimeout(preview, 130);
 }
-
 /* ---------- 呈现模式 ---------- */
 function setMode(m, silent){
-  MODE = (+m === 1) ? 1 : 0;
+  var nextMode = (+m === 1) ? 1 : 0;
+  var modeChanged = nextMode !== MODE;
+  if (modeChanged){
+    selByMode[MODE] = selIdx;
+    selIdx = selByMode[nextMode];
+  }
+  MODE = nextMode;
+  if (!curObjs()[selIdx]){
+    selIdx = -1;
+    if (modeChanged) txtEl.value = "";
+  }
   document.querySelectorAll("#modes button").forEach(function(b){
     b.classList.toggle("on", +b.dataset.m === MODE);
   });
@@ -1295,9 +1376,9 @@ function setMode(m, silent){
   $("styleCard").style.display = imageMode ? "" : "none";
   $("textOnRow").style.display = imageMode ? "" : "none";
   $("objBgRow").style.display  = imageMode ? "none" : "";
-  selIdx = -1;
   if (imageMode) initCrop(); else destroyCrop();
   refreshTextUI();
+  syncSel();
   goEl.disabled = imageMode ? !img : false;
   cfg.lastMode = MODE;
   saveCfg();
@@ -1336,7 +1417,7 @@ function initCrop(){
       crCropMax();
       schedulePreview(false);
     },
-    crop: function(){ schedulePreview(true); },
+    /* 手势期间只由 Cropper 更新裁剪画面，松手后再量化下方目标预览。 */
     cropend: function(){ cropInvalid(); schedulePreview(false); }
   });
 }
@@ -1481,9 +1562,29 @@ function loadFile(f){
   im.onerror = function(){ msg("图片解码失败，换一张试试", "err"); };
   im.src = url;
 }
-dropEl.addEventListener("click", function(){ fileEl.click(); });
-$("refile").addEventListener("click", function(e){ e.stopPropagation(); fileEl.click(); });
-fileEl.addEventListener("change", function(){ loadFile(fileEl.files[0]); });
+/* 部分品牌安卓手机Android captive WebView 没实现 onShowFileChooser 时，input 仍会收到 click，但页面
+   不会失焦/隐藏，也不会收到 change。首次点击启动一次检测，连续点击不重置计时器；PC/iOS
+   永不显示，能正常拉起相册的 Android 浏览器也保持隐藏。 */
+var pickerLeftPage = false, pickerTimer = 0;
+function pickerDidLeave(){ if (pickerTimer) pickerLeftPage = true; }
+window.addEventListener("blur", pickerDidLeave);
+document.addEventListener("visibilitychange", function(){ if (document.hidden) pickerDidLeave(); });
+fileEl.addEventListener("click", function(){
+  if (!captivePage || !/Android/i.test(navigator.userAgent)) return;
+  if (pickerTimer || $("browserFallback").classList.contains("show")) return;
+  pickerLeftPage = false;
+  pickerTimer = setTimeout(function(){
+    pickerTimer = 0;
+    if (!pickerLeftPage) $("browserFallback").classList.add("show");
+  }, 800);
+});
+fileEl.addEventListener("change", function(){
+  clearTimeout(pickerTimer);
+  pickerTimer = 0;
+  pickerLeftPage = false;
+  $("browserFallback").classList.remove("show");
+  loadFile(fileEl.files[0]);
+});
 ["dragenter","dragover"].forEach(function(ev){
   document.addEventListener(ev, function(e){ e.preventDefault(); });
 });
@@ -1624,7 +1725,7 @@ FONTS.forEach(function(f, i){
   o.value = i; o.textContent = ["系统默认","宋体","楷体","等宽"][i];
   $("tFont").appendChild(o);
 });
-var selIdx = -1;
+var selIdx = -1, selByMode = [-1, -1];
 function curObjs(){ return (MODE === 0) ? cfg.objsImg : cfg.objsNote; }
 function newObj(){
   return { x:EW/2, y:EH/2, text:"",
@@ -1662,7 +1763,7 @@ function syncSel(){
   ["tFont","tSize","tColor","tRot","tStroke","tStrokeC","tObjBg"].forEach(function(id){
     var el = $(id); if (el) el.disabled = !o;
   });
-  if (!o){ return; }
+  if (!o){ txtEl.value = ""; return; }
   txtEl.value = o.text;
   $("tFont").value = String(o.font|0);
   $("tSize").value = Math.round(o.size);
@@ -1694,8 +1795,12 @@ bindSel("tStrokeC","strokeC","change");
 bindSel("tObjBg","bg","change");
 txtEl.addEventListener("input", function(){
   var o = curObjs()[selIdx];
-  if (o){ o.text = txtEl.value; relayoutOne(selIdx); }
-  saveCfg(); schedulePreview(false);
+  if (o){
+    o.text = txtEl.value;
+    relayoutOne(selIdx);
+  }
+  saveCfg();
+  if (o) schedulePreview(false);
 });
 $("tBg").addEventListener("change", function(){ cfg.textBg = +$("tBg").value; saveCfg(); schedulePreview(false); });
 
@@ -1703,24 +1808,29 @@ $("tBg").addEventListener("change", function(){ cfg.textBg = +$("tBg").value; sa
 function objScale(){
   return (prevWrapEl.clientWidth || EW) / EW;
 }
-function relayoutOne(i){
-  var objs = curObjs(), o = objs[i], el = objLayerEl.children[i];
-  if (!o || !el) return;
-  var s = objScale();
-  var m = objMetrics(o, s);
-  el.style.left = (o.x * s) + "px";
-  el.style.top  = (o.y * s) + "px";
-  el.style.transform = "translate(-50%,-50%) rotate(" + (+o.rot||0) + "deg)";
-  /* R1.0.15 Fabric 模式：画布是唯一视觉源（.tobj 文字永久透明），
-     手柄框 = measureText 实测包围盒 + 画布同款内边距，永远紧贴文字，无固定宽度补丁 */
-  el.style.width  = Math.max(30, Math.round(m.mw + m.pX*2)) + "px";
-  el.style.height = Math.max(30, Math.round(m.blockH + m.pY*2)) + "px";
-  el.textContent = "";
+function ensureObjHandles(el){
+  if (el.querySelector(".hnd")) return;
   var hS = document.createElement("i"); hS.className = "hnd h-s"; hS.dataset.a = "s";
   var hR = document.createElement("i"); hR.className = "hnd h-r"; hR.dataset.a = "r";
   var hW = document.createElement("i"); hW.className = "hnd h-w"; hW.dataset.a = "wl";
   var hDel = document.createElement("i"); hDel.className = "hnd h-del"; hDel.dataset.a = "del";
   el.appendChild(hS); el.appendChild(hR); el.appendChild(hW); el.appendChild(hDel);
+}
+function relayoutOne(i, keepSize){
+  var objs = curObjs(), o = objs[i], el = objLayerEl.children[i];
+  if (!o || !el) return;
+  var s = objScale();
+  el.style.left = (o.x * s) + "px";
+  el.style.top  = (o.y * s) + "px";
+  el.style.transform = "translate(-50%,-50%) rotate(" + (+o.rot||0) + "deg)";
+  /* R1.0.15 Fabric 模式：画布是唯一视觉源（.tobj 文字永久透明），
+     手柄框 = measureText 实测包围盒 + 画布同款内边距，永远紧贴文字，无固定宽度补丁 */
+  if (!keepSize){
+    var m = objMetrics(o, s);
+    el.style.width  = Math.max(30, Math.round(m.mw + m.pX*2)) + "px";
+    el.style.height = Math.max(30, Math.round(m.blockH + m.pY*2)) + "px";
+  }
+  ensureObjHandles(el);
   el.classList.toggle("sel", i === selIdx);
 }
 function layoutObjs(){
@@ -1788,7 +1898,6 @@ function odMove(e){
     o.rot = rotSnap(clamp(Math.round(od.rot0 + (a - od.a0)), -180, 180));
     $("tRot").value = Math.round(o.rot);
   }
-  relayoutOne(od.i);
   scheduleLive();          /* 实时重绘：每帧 = 底图贴回 + 全部文字矢量重画 */
   e.preventDefault();
 }
@@ -1815,30 +1924,47 @@ function upload(){
   if (MODE === 0 && !previewOK){ msg("预览生成中，请稍候再上传", "err"); return; }
   goEl.disabled = true;
   msg("正在合成画面…", "");
+  showWorkLoading("正在生成上传数据…");
+  afterLoadingPaint(buildAndUpload);
+}
+function buildAndUpload(){
   var payload;
   try { payload = packFull(); }
-  catch(e){ msg("合成失败：" + e.message, "err"); goEl.disabled = false; return; }
+  catch(e){
+    hideWorkLoading();
+    msg("合成失败：" + e.message, "err");
+    goEl.disabled = false;
+    return;
+  }
   var body = frameWithHeader(payload);
   msg("正在上传 " + (body.length/1024).toFixed(0) + " KB…", "");
+  updateWorkLoading("正在上传… 0%");
   setBar(0);
   var xhr = new XMLHttpRequest();
   xhr.open("POST", api("/api/frame"));
   xhr.timeout = 30000;   /* R1.0.22：软超时，弱信号下不挂死 */
   xhr.ontimeout = function(){
+    hideWorkLoading();
     barEl.style.display = "none";
     msg("上传超时，请重试", "err");
     goEl.disabled = (MODE === 0) ? !img : false;
   };
   xhr.upload.onprogress = function(e){
-    if (e.lengthComputable) setBar(e.loaded/e.total);
+    if (e.lengthComputable){
+      var frac = e.loaded/e.total;
+      setBar(frac);
+      updateWorkLoading("正在上传… " + Math.round(frac*100) + "%");
+    }
   };
   xhr.onload = function(){
+    hideWorkLoading();
     barEl.style.display = "none";
     if (xhr.status === 200){ msg("已上传，屏幕刷新中…", "ok"); }
     else { msg("上传失败：" + (xhr.responseText || ("HTTP " + xhr.status)), "err"); }
     goEl.disabled = (MODE === 0) ? !img : false;
   };
   xhr.onerror = function(){
+    hideWorkLoading();
     barEl.style.display = "none";
     msg("网络错误：请确认已连接设备热点", "err");
     goEl.disabled = (MODE === 0) ? !img : false;
