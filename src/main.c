@@ -130,8 +130,6 @@ static esp_err_t page_handler(httpd_req_t *req)
 {
     power_activity();
 
-    if (captive_probe_redirect(req)) return ESP_OK;
-
     if (ota_web_has_page()) return ota_web_stream_page(req);
 
     /* 页面随固件一起更新，浏览器缓存会让人误判「没生效」——必须禁缓存。
@@ -320,7 +318,9 @@ static httpd_handle_t start_server(void)
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = HTTPD_STACK;
     cfg.max_uri_handlers = HTTPD_MAX_URI;
-    cfg.max_open_sockets = 4;
+    /* iOS 会并发发起多条 captive 探测连接；容量与 Espressif 官方 captive portal
+       示例保持一致，避免低上限下探测连接被 LRU 提前清掉。 */
+    cfg.max_open_sockets = 13;
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 10;
     cfg.send_wait_timeout = 10;
@@ -339,6 +339,8 @@ static httpd_handle_t start_server(void)
         { .uri = "/api/frame",      .method = HTTP_POST,   .handler = frame_upload_handler, .user_ctx = NULL },
         { .uri = "/api/clear",      .method = HTTP_POST,   .handler = clear_handler,        .user_ctx = NULL },
         { .uri = "/api/factory",    .method = HTTP_POST,   .handler = factory_handler,      .user_ctx = NULL },
+        { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_apple_landing, .user_ctx = NULL },
+        { .uri = "/library/test/success.html", .method = HTTP_GET, .handler = captive_apple_landing, .user_ctx = NULL },
         { .uri = "*",               .method = HTTP_OPTIONS,.handler = options_handler,      .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
@@ -348,6 +350,13 @@ static httpd_handle_t start_server(void)
     }
 
     ota_web_register(server);
+
+    /* 必须在所有业务路由之后注册：OS 探测路径此前直接 404，根本进不了首页。
+       兜底 GET 同时覆盖带查询参数的探测与厂商自定义路径。 */
+    const httpd_uri_t captive = {
+        .uri = "/*", .method = HTTP_GET, .handler = captive_redirect, .user_ctx = NULL,
+    };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &captive));
     return server;
 }
 

@@ -20,6 +20,9 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # ---- WiFi 仅 SoftAP（无 STA）；缓冲池保持 IDF 默认 32（不要为了省内存去砍）----
 CONFIG_ESP_WIFI_ENABLED=y
 
+# ---- captive portal：Espressif 官方示例使用 16 个 lwIP socket，HTTPD 可用 13 个 ----
+CONFIG_LWIP_MAX_SOCKETS=16
+
 # ---- 自定义分区表：双 OTA(1.5MB×2) + 960KB 页面分区 ----
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

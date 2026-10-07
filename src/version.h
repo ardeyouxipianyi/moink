@@ -35,8 +35,21 @@
  *
  * 升级判据：改的是页面还是固件由「统一入口上传的文件类型」决定，不再需要人判断；
  * 版本号推进幅度按上表取值。
+ *
+ * R1.2.1 变更（2026-10-04）：
+ *   - 修复 captive portal 探测请求未进入处理函数、直接返回 404 的问题，并完善
+ *     DHCP DNS 与 A、AAAA、HTTPS 等 DNS 查询响应；不向 iPhone 下发需要可信 HTTPS
+ *     API 的 Option 114，改由 DNS 劫持和 HTTP 探测重定向触发门户。兼容 Apple DNS
+ *     多问题查询，并按 Espressif 官方示例扩充 captive 探测并发 socket；Apple 探测
+ *     地址返回轻量 Safari 引导页，复制地址后显示友好完成页，后台复探返回标准 Success，
+ *     热点保持连接供 Safari 打开正式配置页；客户端断开后立即清除 Success 状态，下次
+ *     连接重新显示引导页，60 秒超时仅作兜底。
+ *   - WiFi 发射功率默认档由高（18dBm）调整为中（10dBm），解决部分ESP32 C3 supermini在默认高功率手机很难连接问题。
+ *   - 缩放、裁剪图片时松手再做计算，体验更丝滑
+ *   - 缩放、裁剪图片时松手再做计算，体验更丝滑
+ *   - 文本框在localStorage保存导致下次打开时文本仍在问题解决
  */
 #define MOINK_API_VERSION   2
-#define MOINK_VERSION       "R1.2.0"
+#define MOINK_VERSION       "R1.2.1"
 
 #endif /* MOINK_VERSION_H */

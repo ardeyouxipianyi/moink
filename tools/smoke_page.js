@@ -11,6 +11,8 @@ const path = require("path");
 const vm = require("vm");
 
 const page = fs.readFileSync(path.join(__dirname, "..", "page", "index.html"), "utf8");
+const captive = fs.readFileSync(path.join(__dirname, "..", "src", "captive.c"), "utf8");
+const netifAp = fs.readFileSync(path.join(__dirname, "..", "src", "netif_ap.c"), "utf8");
 // R1.0.12 起页面有两个 <script> 块（第 1 块 = 内嵌 Cropper.js，第 2 块 = 主脚本）。
 // \r?\n：兼容 core.autocrlf 检出为 CRLF 的工作区（2026-09-22 修正）。
 const m = page.match(/<script>\r?\n"use strict";\r?\n([\s\S]*?)\r?\n<\/script>/);
@@ -214,7 +216,45 @@ ok("R1.2.0 热点密码单字段语义（留空=保持 / 勾选清除=开放，F
 ok("R1.2.0 热点保存按需携带 pass（缺省不发送 = 固件保持）",
    js.indexOf('if ($("apClearPw").checked) fields.pass = "";') >= 0
    && js.indexOf('else if ($("apPass").value) fields.pass = $("apPass").value;') >= 0);
-ok("R1.2.0 版本 meta", page.indexOf('content="R1.2.0"') >= 0);
+ok("R1.2.1 版本 meta", page.indexOf('content="R1.2.1"') >= 0);
+ok("R1.2.1 正式配置页不含 iOS captive 专用渲染逻辑",
+   js.indexOf("captiveLitePreview") < 0 && js.indexOf("iosDevice") < 0
+   && page.indexOf("iosCaptiveNotice") < 0
+   && js.indexOf("return packIdx(rotateCW(renderComposite(EW, EH), EW, EH))") >= 0);
+ok("R1.2.1 上传前显示 loading",
+   page.indexOf('id="workLoading"') >= 0 && page.indexOf('id="workLoadingText"') >= 0
+   && js.indexOf("function afterLoadingPaint(fn)") >= 0
+   && js.indexOf('showWorkLoading("正在生成上传数据…")') >= 0
+   && js.indexOf("afterLoadingPaint(buildAndUpload)") >= 0);
+ok("R1.2.1 裁剪手势松手后才生成目标预览",
+   js.indexOf("crop: function(){ schedulePreview(true); }") < 0
+   && js.indexOf("cropend: function(){ cropInvalid(); schedulePreview(false); }") >= 0);
+ok("R1.2.1 Apple captive 使用轻量 Safari 引导页并返回 Success",
+   captive.indexOf("请使用 Safari 打开配置页") >= 0
+   && captive.indexOf("<p>墨印 · MoInk</p>") >= 0
+   && captive.indexOf("连接窗口性能较低") < 0
+   && captive.indexOf("复制地址并关闭此页") >= 0
+   && captive.indexOf("192.168.4.1") >= 0
+   && captive.indexOf("moink_done=1") >= 0
+   && captive.indexOf("请点击右上角的“完成”关闭此页面") >= 0
+   && captive.indexOf("<TITLE>Success</TITLE>") >= 0
+   && captive.indexOf("#define APPLE_SUCCESS_WINDOW_MS 60000") >= 0
+   && netifAp.indexOf("captive_apple_station_disconnected();") >= 0
+   && captive.indexOf("captive_deauth_task") < 0);
+ok("R1.2.1 小米文件选择兜底缩短为 0.8 秒",
+   js.indexOf('if (!pickerLeftPage) $("browserFallback").classList.add("show");') >= 0
+   && js.indexOf("}, 800);") >= 0 && js.indexOf("}, 1200);") < 0);
+ok("R1.2.1 文字框仅当前会话有效，重新打开页面为空",
+   js.indexOf("delete stored.objsImg; delete stored.objsNote; delete stored.text;") >= 0
+   && js.indexOf("cfg.objsImg = [];") >= 0
+   && js.indexOf("cfg.objsNote = [];") >= 0
+   && js.indexOf('if (!o){ txtEl.value = ""; return; }') >= 0);
+ok("R1.2.1 文字拖动全尺寸并复用 DOM 手柄",
+   js.indexOf("liveBase = renderBase(EW, EH)") >= 0
+   && js.indexOf("function ensureObjHandles(el)") >= 0
+   && js.indexOf('if (el.querySelector(".hnd")) return') >= 0
+   && js.indexOf('if (od) relayoutOne(od.i, od.act === "m" || od.act === "r")') >= 0
+   && js.indexOf('el.textContent = "";\n  var hS') < 0);
 // DEV_API 三态行为：0 = 未连设备（离线乐观） / 1 = 旧固件（收紧） / 2 = 新固件
 // R1.1.2（FB-013）：mode 1 = 768x552 顺序（默认正解，任何 api 下都是 768x552）；
 //                   mode 2 = 方案A 原生 800x600（需 api>=2，离线按可用乐观）。
