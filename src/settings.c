@@ -10,15 +10,64 @@ static const char *TAG = "settings";
 
 #define NVS_NS "moink"
 
+/* ---------------- 引脚预设与校验（R1.2.2） ----------------
+   GPIO 白名单只放 0..10：11..17 是片内 SPI flash，18/19 是 USB-JTAG，
+   本项目不使用。自锁脚 GPIO2 单独排除。 */
+const pin_cfg_t PIN_PRESETS[GPIO_PRESET_NPRESET] = {
+    /* [0] 默认：SCK=4 MOSI=6 CS=7 DC=1 RST=3 BUSY=10，唤醒=5，ADC=0 */
+    [GPIO_PRESET_DEFAULT] = { { 0, 5, 4, 6, 7, 1, 3, 10 } },
+    /* [1] 排线：SCK=7 MOSI=10 CS=6 DC=4 RST=3 BUSY=1，唤醒=5，ADC=0 */
+    [GPIO_PRESET_LINE]    = { { 0, 5, 7, 10, 6, 4, 3, 1 } },
+    /* [2] 整合板：SCK=4 MOSI=3 CS=5 DC=6 RST=7 BUSY=10，唤醒=1，ADC=0 */
+    [GPIO_PRESET_BOARD]   = { { 0, 1, 4, 3, 5, 6, 7, 10 } },
+};
+
+bool pin_io_allowed(uint8_t io)
+{
+    if (io > 10) return false;          /* 11..17 flash、18/19 USB、20/21 UART0 全排除 */
+    if (io == PIN_SELF_LOCK) return false;  /* GPIO2 已被自锁占用 */
+    return true;
+}
+
+bool pin_adc_allowed(uint8_t io)  { return io <= 4; }   /* ADC1_CH0..CH4 = GPIO0..4 */
+bool pin_wake_allowed(uint8_t io) { return io <= 5; }   /* RTC 域 GPIO0..5 */
+
+bool pin_cfg_valid(const pin_cfg_t *c)
+{
+    if (!c) return false;
+    for (int i = 0; i < PIN_IDX_COUNT; i++) {
+        uint8_t io = c->v[i];
+        if (i == PIN_IDX_ADC) {
+            if (!pin_adc_allowed(io)) return false;
+        } else if (i == PIN_IDX_WAKE) {
+            if (!pin_wake_allowed(io)) return false;
+        } else {
+            if (!pin_io_allowed(io)) return false;
+        }
+        /* 互不重复。 */
+        for (int j = 0; j < i; j++)
+            if (c->v[j] == io) return false;
+    }
+    return true;
+}
+
+/* ---------------- 设置本体 ---------------- */
+
 static const moink_settings_t DEFAULTS = {
-    .panel    = EPD_PANEL_A0,
-    .hflip    = 0,
-    .a1_mode  = EPD_A1_MODE_DEFAULT,
-    .wifi_pwr = SETT_WIFI_PWR_MID,
-    .sleep_s  = SETT_SLEEP_3MIN,
-    .wake_s   = SETT_WAKE_OFF,
-    .ap_ssid  = "",
-    .ap_pass  = "",
+    .panel       = EPD_PANEL_A0,
+    .hflip       = 0,
+    .wifi_pwr    = SETT_WIFI_PWR_MID,
+    .gpio_preset = GPIO_PRESET_DEFAULT,
+    .pins        = { { 0, 5, 4, 6, 7, 1, 3, 10 } },   /* 与 PIN_PRESETS[0] 一致 */
+    .sleep_s     = SETT_SLEEP_3MIN,
+    .wake_s      = SETT_WAKE_OFF,
+    .ap_ssid     = "",
+    .ap_pass     = "",
+};
+
+/* 引脚 NVS 键名（逐个 u8 存；顺序与 PIN_IDX_* 一致）。 */
+static const char *PIN_KEY[PIN_IDX_COUNT] = {
+    "p_adc", "p_wake", "p_sck", "p_mosi", "p_cs", "p_dc", "p_rst", "p_busy"
 };
 
 static moink_settings_t s_cfg;
@@ -60,8 +109,10 @@ void settings_init(void)
 
     read_u8("panel",   &s_cfg.panel);
     read_u8("hflip",   &s_cfg.hflip);
-    read_u8("a1_mode", &s_cfg.a1_mode);
     read_u8("wifi_pwr", &s_cfg.wifi_pwr);
+    read_u8("gpio_preset", &s_cfg.gpio_preset);
+    for (int i = 0; i < PIN_IDX_COUNT; i++)
+        read_u8(PIN_KEY[i], &s_cfg.pins.v[i]);
     read_u32("sleep_s", &s_cfg.sleep_s);
     read_u32("wake_s",  &s_cfg.wake_s);
     read_str("ap_ssid", s_cfg.ap_ssid, SETT_SSID_MAX);
@@ -69,18 +120,34 @@ void settings_init(void)
 
     /* R1.2.0：旧值不再做兼容归一；越界一律回落到默认档。 */
     if (s_cfg.panel >= EPD_PANEL_COUNT) s_cfg.panel = DEFAULTS.panel;
-    if (s_cfg.a1_mode < EPD_A1_MODE_SEQ552 || s_cfg.a1_mode > EPD_A1_MODE_NATIVE800)
-        s_cfg.a1_mode = EPD_A1_MODE_DEFAULT;
     if (s_cfg.hflip) s_cfg.hflip = 1;
 
-    ESP_LOGI(TAG, "panel=%u hflip=%u a1_mode=%u sleep=%lus wake=%lus ssid='%s' open=%d",
-             s_cfg.panel, s_cfg.hflip, s_cfg.a1_mode,
+    /* 引脚：预设档直接用预设表；自定义档校验失败则整体回落默认（避免半套引脚
+       启动，把设备带进「屏不亮」的不可诊断状态）。 */
+    if (s_cfg.gpio_preset >= GPIO_PRESET_COUNT) s_cfg.gpio_preset = GPIO_PRESET_DEFAULT;
+    if (s_cfg.gpio_preset == GPIO_PRESET_CUSTOM) {
+        if (!pin_cfg_valid(&s_cfg.pins)) {
+            ESP_LOGW(TAG, "custom pin map invalid, fallback to default preset");
+            s_cfg.gpio_preset = GPIO_PRESET_DEFAULT;
+            s_cfg.pins = PIN_PRESETS[GPIO_PRESET_DEFAULT];
+        }
+    } else {
+        s_cfg.pins = PIN_PRESETS[s_cfg.gpio_preset];
+    }
+
+    ESP_LOGI(TAG, "panel=%u hflip=%u sleep=%lus wake=%lus ssid='%s' open=%d",
+             s_cfg.panel, s_cfg.hflip,
              (unsigned long)s_cfg.sleep_s, (unsigned long)s_cfg.wake_s,
              s_cfg.ap_ssid[0] ? s_cfg.ap_ssid : "(default)",
              s_cfg.ap_pass[0] == 0);
+    ESP_LOGI(TAG, "gpio preset=%u ADC=%u WAKE=%u SCK=%u MOSI=%u CS=%u DC=%u RST=%u BUSY=%u",
+             s_cfg.gpio_preset, s_cfg.pins.v[0], s_cfg.pins.v[1], s_cfg.pins.v[2],
+             s_cfg.pins.v[3], s_cfg.pins.v[4], s_cfg.pins.v[5],
+             s_cfg.pins.v[6], s_cfg.pins.v[7]);
 }
 
 const moink_settings_t *settings_get(void) { return &s_cfg; }
+const pin_cfg_t *settings_pins(void) { return &s_cfg.pins; }
 
 static void store_u8(const char *key, uint8_t v)
 {
@@ -120,21 +187,38 @@ esp_err_t settings_set_hflip(uint8_t v)
     return ESP_OK;
 }
 
-esp_err_t settings_set_a1_mode(uint8_t v)
-{
-    if (v < EPD_A1_MODE_SEQ552 || v > EPD_A1_MODE_NATIVE800) v = EPD_A1_MODE_DEFAULT;
-    s_cfg.a1_mode = v;
-    store_u8("a1_mode", v);
-    settings_commit();
-    return ESP_OK;
-}
-
 esp_err_t settings_set_wifi_pwr(uint8_t v)
 {
     if (v > SETT_WIFI_PWR_LOW) return ESP_ERR_INVALID_ARG;
     s_cfg.wifi_pwr = v;
     store_u8("wifi_pwr", v);
     settings_commit();
+    return ESP_OK;
+}
+
+esp_err_t settings_set_gpio(uint8_t preset, const pin_cfg_t *custom)
+{
+    pin_cfg_t applied;
+
+    if (preset >= GPIO_PRESET_NPRESET) {
+        /* 自定义档：必须整体合法才接受。 */
+        if (preset != GPIO_PRESET_CUSTOM || !pin_cfg_valid(custom))
+            return ESP_ERR_INVALID_ARG;
+        applied = *custom;
+    } else {
+        applied = PIN_PRESETS[preset];
+    }
+
+    s_cfg.gpio_preset = preset;
+    s_cfg.pins = applied;
+    store_u8("gpio_preset", preset);
+    for (int i = 0; i < PIN_IDX_COUNT; i++)
+        store_u8(PIN_KEY[i], applied.v[i]);
+    settings_commit();
+
+    ESP_LOGI(TAG, "gpio set: preset=%u ADC=%u WAKE=%u SCK=%u MOSI=%u CS=%u DC=%u RST=%u BUSY=%u",
+             preset, applied.v[0], applied.v[1], applied.v[2], applied.v[3],
+             applied.v[4], applied.v[5], applied.v[6], applied.v[7]);
     return ESP_OK;
 }
 
@@ -196,23 +280,24 @@ void settings_factory_reset(void)
 
 void settings_reset_for_upgrade(void)
 {
-    /* 每次固件升级都强制重置设置：旧值不参与兼容（FB-015）。热点名与密码**保留**，
-       否则设备会以默认开放热点出现，用户得重新寻找并重连才能继续用页面。 */
-    static const char *KEYS[] = { "panel", "hflip", "a1_mode",
-                                  "wifi_pwr", "sleep_s", "wake_s" };
-    char ssid[SETT_SSID_MAX], pass[SETT_PASS_MAX];
-    strlcpy(ssid, s_cfg.ap_ssid, sizeof(ssid));
-    strlcpy(pass, s_cfg.ap_pass, sizeof(pass));
+    /* R1.2.2：升级**不再强制重置设置**，只清理「本版已经不存在、留着会让旧值被
+       误读」的废弃键；其余用户设置（屏型 / 翻转 / 功率 / GPIO 接法 / 休眠 / 唤醒 /
+       热点凭据）一律原样保留。
+       回退到全量重置会误伤真正描述硬件的项：R1.2.0 的重置会让 A1 设备升级后按 A0
+       驱动、让排线 / 整合板接线按默认引脚启动，用户升级完得重新配一遍，甚至先看到
+       「屏不亮」。 */
+    static const char *DROP_KEYS[] = {
+        "a1_mode",   /* R1.2.2：A1 只剩 768x552 顺序一档，旧档位值 1..4 已无对应含义 */
+        "a11_var",   /* R1.2.0：A1.1 诊断变体整体删除 */
+    };
 
     if (s_ok) {
-        for (size_t i = 0; i < sizeof(KEYS) / sizeof(KEYS[0]); i++)
-            nvs_erase_key(s_nvs, KEYS[i]);
+        for (size_t i = 0; i < sizeof(DROP_KEYS) / sizeof(DROP_KEYS[0]); i++)
+            nvs_erase_key(s_nvs, DROP_KEYS[i]);   /* 键不存在时返回 NOT_FOUND，忽略即可 */
         nvs_commit(s_nvs);
     }
 
-    s_cfg = DEFAULTS;
-    strlcpy(s_cfg.ap_ssid, ssid, SETT_SSID_MAX);
-    strlcpy(s_cfg.ap_pass, pass, SETT_PASS_MAX);
-    ESP_LOGW(TAG, "upgrade reset: settings cleared, AP credentials kept (ssid='%s')",
-             s_cfg.ap_ssid[0] ? s_cfg.ap_ssid : "(default)");
+    ESP_LOGW(TAG, "upgrade: dropped %u obsolete key(s), settings kept (panel=%u preset=%u)",
+             (unsigned)(sizeof(DROP_KEYS) / sizeof(DROP_KEYS[0])),
+             (unsigned)s_cfg.panel, (unsigned)s_cfg.gpio_preset);
 }

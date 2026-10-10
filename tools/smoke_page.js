@@ -13,6 +13,11 @@ const vm = require("vm");
 const page = fs.readFileSync(path.join(__dirname, "..", "page", "index.html"), "utf8");
 const captive = fs.readFileSync(path.join(__dirname, "..", "src", "captive.c"), "utf8");
 const netifAp = fs.readFileSync(path.join(__dirname, "..", "src", "netif_ap.c"), "utf8");
+// R1.2.2：引脚运行时代化 / GPIO 预设 / 自锁脚 需在固件侧交叉校验
+const settingsH = fs.readFileSync(path.join(__dirname, "..", "src", "settings.h"), "utf8");
+const epdDrvC = fs.readFileSync(path.join(__dirname, "..", "src", "epd_drv.c"), "utf8");
+const mainC = fs.readFileSync(path.join(__dirname, "..", "src", "main.c"), "utf8");
+const settingsC = fs.readFileSync(path.join(__dirname, "..", "src", "settings.c"), "utf8");
 // R1.0.12 起页面有两个 <script> 块（第 1 块 = 内嵌 Cropper.js，第 2 块 = 主脚本）。
 // \r?\n：兼容 core.autocrlf 检出为 CRLF 的工作区（2026-09-22 修正）。
 const m = page.match(/<script>\r?\n"use strict";\r?\n([\s\S]*?)\r?\n<\/script>/);
@@ -147,27 +152,51 @@ ok("wrap handle h-w (left-bottom) + red delete handle h-del",
 }
 ok("portrait migration (m16rot)", js.indexOf("cfg.m16rot") >= 0);
 
-// R1.1.0（FB-010）：A1 驱动模式 + 编辑空间几何随模式切换
-// R1.1.1（FB-011/FB-012）：已删 a1Hint + DEV_API 三态 + OTA 同步页面
-// R1.1.2（FB-013）：真机定案后 A1 收敛为两档（768x552 顺序默认 / 800x600 对照）
-ok("R1.1.2 A1 drive mode UI (a1Row/a1Sel, a1Hint removed)",
-   page.includes('id="a1Row"') && page.includes('id="a1Sel"') && page.indexOf("a1Hint") < 0);
-ok("R1.1.2 A1 options reduced to exactly two",
-   page.includes('<option value="1">768×552 顺序</option>')
-   && page.includes('<option value="2">方案A 原生800×600</option>')
-   && page.indexOf("方案D 相位1") < 0 && page.indexOf("方案D 相位2") < 0
-   && page.indexOf("方案A′") < 0 && page.indexOf("A1MODE_MAX = 4") < 0);
-ok("R1.1.2 A1MODE default = 1 / max = 2",
-   js.indexOf("var A1MODE = 1;") >= 0 && js.indexOf("var A1MODE_MAX = 2;") >= 0);
-ok("R1.1.1 geometry helpers",
-   js.indexOf("function panelGeomOf") >= 0 && js.indexOf("function applyPanelGeom") >= 0
-   && js.indexOf("function migrateGeomTo") >= 0 && js.indexOf("function onGeomChanged") >= 0);
-ok("R1.1.0 frame version follows geometry", js.indexOf("(PANEL.w === 800) ? 2 : 1") >= 0);
-ok("R1.1.1 DEV_API tri-state + apiAtLeast2()",
-   js.indexOf("var DEV_API = 0") >= 0 && js.indexOf("function apiAtLeast2()") >= 0
-   && js.indexOf("DEV_API === 0 || DEV_API >= 2") >= 0);
-ok("R1.1.0 a1_mode saved with panel",
-   js.indexOf('fields.a1_mode = $("a1Sel").value') >= 0 && js.indexOf("syncPanelRows") >= 0);
+// R1.2.2：A1 真机验收通过后只保留 768x552 顺序档，A1 驱动二级菜单整体删除。
+ok("R1.2.2 A1 drive second-level menu removed",
+   page.indexOf('id="a1Row"') < 0 && page.indexOf('id="a1Sel"') < 0
+   && page.indexOf("a1Hint") < 0 && js.indexOf("A1MODE") < 0
+   && js.indexOf("a1_mode") < 0 && js.indexOf("panelGeomOf") < 0
+   && js.indexOf("syncPanelRows") < 0 && js.indexOf("apiAtLeast2") < 0);
+ok("R1.2.2 geometry helpers kept (geom now constant 768x552)",
+   js.indexOf("function applyPanelGeom") >= 0 && js.indexOf("function migrateGeomTo") >= 0
+   && js.indexOf("function onGeomChanged") >= 0
+   && js.indexOf("PANEL.w === 768 && PANEL.h === 552") >= 0);
+ok("R1.2.2 frame version pinned to 1 (800x600 dropped)",
+   js.indexOf("hdr[2] = 1;") >= 0 && js.indexOf("(PANEL.w === 800) ? 2 : 1") < 0);
+ok("R1.2.2 DEV_API kept",
+   js.indexOf("var DEV_API = 0") >= 0 && js.indexOf("if (j.api != null) DEV_API") >= 0);
+ok("R1.2.2 GPIO 设置 UI (preset/custom/save/reboot/state)",
+   page.includes('id="gpioPreset"') && page.includes('id="gpioCustom"')
+   && page.includes('id="saveGpio"') && page.includes('id="saveGpioReboot"')
+   && page.includes('id="gpiomsg"')
+   && js.indexOf("function syncGpioSels") >= 0 && js.indexOf("function gpioPool") >= 0
+   && js.indexOf("function loadGpio") >= 0 && js.indexOf("function gpioFields") >= 0);
+ok("R1.2.2 GPIO 受限池 (ADC 0-4 / WAKE 0-5 / 白名单去自锁脚 2)",
+   js.indexOf("if (i === 0) return [0,1,2,3,4];") >= 0
+   && js.indexOf("if (i === 1) return [0,1,2,3,4,5];") >= 0
+   && js.indexOf("var GPIO_WHITE = [0,1,3,4,5,6,7,8,9,10];") >= 0
+   && js.indexOf('var GPIO_KEY   = ["adc","wake","sck","mosi","cs","dc","rst","busy"];') >= 0);
+ok("R1.2.2 自定义引脚以 p_* 提交、回读走 pins[] 数组",
+   js.indexOf('fields["p_" + GPIO_KEY[i]] = sel.value;') >= 0
+   && js.indexOf('if (k.indexOf("p_") === 0)') >= 0 && js.indexOf("s.pins[gi]") >= 0);
+ok("R1.2.2 保存并重启走 /api/reboot",
+   js.indexOf('fetch(api("/api/reboot"), { method: "POST" })') >= 0);
+ok("R1.2.2 固件侧：引脚运行时化 + 三档预设 + 自锁脚 + 无 EPD_PIN_ 残留",
+   settingsH.indexOf("#define PIN_SELF_LOCK  2") >= 0
+   && settingsH.indexOf("GPIO_PRESET_LINE     1") >= 0
+   && settingsH.indexOf("GPIO_PRESET_BOARD    2") >= 0
+   && settingsH.indexOf("GPIO_PRESET_CUSTOM   3") >= 0
+   && epdDrvC.indexOf("settings_pins()") >= 0 && epdDrvC.indexOf("EPD_PIN_") < 0);
+ok("R1.2.2 固件侧：自锁 GPIO2 上电拉高 + /api/reboot + 无 a1_mode",
+   mainC.indexOf("gpio_set_level((gpio_num_t)PIN_SELF_LOCK, 1);") >= 0
+   && mainC.indexOf('"/api/reboot"') >= 0 && mainC.indexOf("epd_set_a1_mode") < 0);
+// R1.2.2：升级不再全量重置设置，只清理本版已废弃的键（a1_mode / a11_var）。
+const rfu = settingsC.slice(settingsC.indexOf("void settings_reset_for_upgrade"));
+ok("R1.2.2 固件侧：升级只清废弃键、不重置用户设置",
+   rfu.indexOf("DROP_KEYS") >= 0 && rfu.indexOf('"a1_mode"') >= 0
+   && rfu.indexOf('"a11_var"') >= 0 && rfu.indexOf("s_cfg = DEFAULTS") < 0
+   && rfu.indexOf('"sleep_s"') < 0);
 // R1.2.0（FB-015）：版本号由 fw/page 两套合并为 MOINK_VERSION 一套；
 //   固件与控制页合并到同一入口 /api/upload，由固件按请求体首块内容嗅探分流。
 ok("R1.2.0 统一升级入口 UI (upFile/upGo/upmsg)",
@@ -216,7 +245,7 @@ ok("R1.2.0 热点密码单字段语义（留空=保持 / 勾选清除=开放，F
 ok("R1.2.0 热点保存按需携带 pass（缺省不发送 = 固件保持）",
    js.indexOf('if ($("apClearPw").checked) fields.pass = "";') >= 0
    && js.indexOf('else if ($("apPass").value) fields.pass = $("apPass").value;') >= 0);
-ok("R1.2.1 版本 meta", page.indexOf('content="R1.2.1"') >= 0);
+ok("R1.2.2 版本 meta", page.indexOf('content="R1.2.2"') >= 0);
 ok("R1.2.1 正式配置页不含 iOS captive 专用渲染逻辑",
    js.indexOf("captiveLitePreview") < 0 && js.indexOf("iosDevice") < 0
    && page.indexOf("iosCaptiveNotice") < 0
@@ -255,26 +284,12 @@ ok("R1.2.1 文字拖动全尺寸并复用 DOM 手柄",
    && js.indexOf('if (el.querySelector(".hnd")) return') >= 0
    && js.indexOf('if (od) relayoutOne(od.i, od.act === "m" || od.act === "r")') >= 0
    && js.indexOf('el.textContent = "";\n  var hS') < 0);
-// DEV_API 三态行为：0 = 未连设备（离线乐观） / 1 = 旧固件（收紧） / 2 = 新固件
-// R1.1.2（FB-013）：mode 1 = 768x552 顺序（默认正解，任何 api 下都是 768x552）；
-//                   mode 2 = 方案A 原生 800x600（需 api>=2，离线按可用乐观）。
-sandbox.DEV_API = 0;
-eq("R1.1.2 offline(0) + mode 1 (default) -> 768x552",
-   sandbox.panelGeomOf(1, 1).w + "x" + sandbox.panelGeomOf(1, 1).h, "768x552");
-eq("R1.1.2 offline(0) + mode 2 (native800) -> 800x600",
-   sandbox.panelGeomOf(1, 2).w + "x" + sandbox.panelGeomOf(1, 2).h, "800x600");
-sandbox.DEV_API = 1;
-eq("R1.1.2 legacy api=1 + mode 2 -> 768x552 (tightened)",
-   sandbox.panelGeomOf(1, 2).w + "x" + sandbox.panelGeomOf(1, 2).h, "768x552");
-eq("R1.1.2 legacy api=1 + mode 1 -> 768x552",
-   sandbox.panelGeomOf(1, 1).w + "x" + sandbox.panelGeomOf(1, 1).h, "768x552");
-sandbox.DEV_API = 2;
-eq("R1.1.2 api=2 + mode 2 -> native 800x600",
-   sandbox.panelGeomOf(1, 2).w + "x" + sandbox.panelGeomOf(1, 2).h, "800x600");
-eq("R1.1.2 api=2 + mode 1 (default) -> 768x552",
-   sandbox.panelGeomOf(1, 1).w + "x" + sandbox.panelGeomOf(1, 1).h, "768x552");
-sandbox.DEV_API = 0;   /* 还原初态，避免污染后续断言 */
-eq("R1.1.0 panelGeomOf A0 ignores mode", sandbox.panelGeomOf(0, 1).w + "x" + sandbox.panelGeomOf(0, 1).h, "768x552");
+// R1.2.2：A0 / A1 几何一致（768x552），几何助手收敛为常量分支。
+ok("R1.2.2 applyPanelGeom(A1) keeps 768x552 and returns false",
+   sandbox.applyPanelGeom(1) === false
+   && sandbox.PANEL.w === 768 && sandbox.PANEL.h === 552
+   && sandbox.EW === 552 && sandbox.EH === 768);
+sandbox.applyPanelGeom(0);   /* 还原 */
 eq("R1.1.0 GEOM_SRC default geometry", sandbox.GEOM_SRC.w + "x" + sandbox.GEOM_SRC.h, "552x768");
 
 ok("R1.2.0 状态栏单版本号 (版本/接口, 无 fw/page 双行)",

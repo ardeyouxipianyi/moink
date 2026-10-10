@@ -14,11 +14,12 @@ static const char *TAG = "power";
 
 #define AUTO_WAKE_WINDOW_S 180   /* 定时唤醒后等人的窗口（秒） */
 
-/* 电池分压 470k:100k => Vbat = Vpin * (470k+100k)/100k = Vpin * 5.7。 */
-#define BAT_DIV_NUM        570
+/* 电池分压 100k:100k => Vbat = Vpin * (100k+100k)/100k = Vpin * 2.0。
+   ⚠️ 分压比是板级硬件事实：换板 / 改电阻必须同步改这里，否则电量整体偏移。 */
+#define BAT_DIV_NUM        200
 #define BAT_DIV_DEN        100
 #define BAT_ADC_MAX        4095
-#define BAT_FULLSCALE_MV   3100   /* 12dB 满量程，按板实测标定 */
+#define BAT_FULLSCALE_MV   3100   /* 12dB 满量程，按板实测标定（换分压后建议复核） */
 /* 未连接判定：单节锂电物理范围 + 连续有效次数（见 power_battery_mv）。 */
 #define BAT_MV_MIN         2400
 #define BAT_MV_MAX         4600
@@ -27,10 +28,19 @@ static adc_oneshot_unit_handle_t s_adc;
 static TickType_t s_last_activity;
 static bool s_auto_wake = false;
 
+/* R1.2.2：唤醒脚与电池 ADC 脚改为运行时从 settings_pins() 取。
+   ADC 通道与引脚在 ESP32-C3 上固定绑定：GPIO0..4 = ADC1_CH0..CH4。 */
+static uint8_t s_wake_pin = 5;
+static adc_channel_t s_adc_ch = ADC_CHANNEL_0;
+
 void power_init(void)
 {
+    const pin_cfg_t *p = settings_pins();
+    s_wake_pin = p->v[PIN_IDX_WAKE];
+    s_adc_ch   = (adc_channel_t)p->v[PIN_IDX_ADC];
+
     gpio_config_t btn = {
-        .pin_bit_mask = 1ULL << EPD_PIN_WAKE_BTN,
+        .pin_bit_mask = 1ULL << s_wake_pin,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -38,7 +48,7 @@ void power_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&btn));
 
-    /* GPIO0 = ADC1_CH0（ADC2 与 WiFi 共用，不可用）。 */
+    /* 电池 ADC：只用 ADC1（ADC2 与 WiFi 共用，不可用），通道随引脚。 */
     adc_oneshot_unit_init_cfg_t u = {
         .unit_id = ADC_UNIT_1,
         .ulp_mode = ADC_ULP_MODE_DISABLE,
@@ -48,7 +58,10 @@ void power_init(void)
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_0, &c));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, s_adc_ch, &c));
+
+    ESP_LOGI(TAG, "wake btn GPIO%u, battery ADC GPIO%u (ADC1_CH%d)",
+             s_wake_pin, p->v[PIN_IDX_ADC], (int)s_adc_ch);
 
     power_activity();
 }
@@ -86,20 +99,26 @@ void power_enter_deep_sleep(void)
     esp_wifi_stop();
     epd_panel_deep_sleep();
 
-    /* 唤醒键：GPIO5 上拉、按钮接 GND，低电平唤醒（已验证路径）。 */
-    gpio_pullup_en((gpio_num_t)EPD_PIN_WAKE_BTN);
-    gpio_pulldown_dis((gpio_num_t)EPD_PIN_WAKE_BTN);
-    gpio_set_direction((gpio_num_t)EPD_PIN_WAKE_BTN, GPIO_MODE_INPUT);
+    /* 唤醒键：内部上拉、按钮接 GND，低电平唤醒（RTC 域 GPIO0..5）。 */
+    gpio_pullup_en((gpio_num_t)s_wake_pin);
+    gpio_pulldown_dis((gpio_num_t)s_wake_pin);
+    gpio_set_direction((gpio_num_t)s_wake_pin, GPIO_MODE_INPUT);
     ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(
-        1ULL << EPD_PIN_WAKE_BTN, ESP_GPIO_WAKEUP_GPIO_LOW));
+        1ULL << s_wake_pin, ESP_GPIO_WAKEUP_GPIO_LOW));
+
+    /* 自锁脚（MOS 一键开机）：深睡期间锁存为高电平，维持 MOS 持续导通。
+       数字域深睡会掉电、普通输出会变高阻，必须用 pad hold 保持；
+       上电时的首次拉高见 main.c。 */
+    gpio_hold_en((gpio_num_t)PIN_SELF_LOCK);
+    gpio_deep_sleep_hold_en();
 
     uint32_t wake_s = settings_get()->wake_s;
     if (wake_s > 0) {
         esp_sleep_enable_timer_wakeup((uint64_t)wake_s * 1000000ULL);
     }
 
-    ESP_LOGI(TAG, "deep sleep (btn GPIO%d low, timer %lus)",
-             EPD_PIN_WAKE_BTN, (unsigned long)wake_s);
+    ESP_LOGI(TAG, "deep sleep (btn GPIO%u low, timer %lus, self-lock GPIO%d held)",
+             s_wake_pin, (unsigned long)wake_s, PIN_SELF_LOCK);
     vTaskDelay(pdMS_TO_TICKS(200));
     esp_deep_sleep_start();
 }
@@ -113,7 +132,7 @@ int power_battery_mv(void)
     static int s_valid = 0;
 
     int raw = 0;
-    if (adc_oneshot_read(s_adc, ADC_CHANNEL_0, &raw) != ESP_OK) { s_valid = 0; return -1; }
+    if (adc_oneshot_read(s_adc, s_adc_ch, &raw) != ESP_OK) { s_valid = 0; return -1; }
     int mv = raw * BAT_FULLSCALE_MV / BAT_ADC_MAX * BAT_DIV_NUM / BAT_DIV_DEN;
 
     if (mv < BAT_MV_MIN || mv > BAT_MV_MAX) { s_valid = 0; return -1; }

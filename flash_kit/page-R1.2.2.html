@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="moink-page-version" content="R1.2.1">
+<meta name="moink-page-version" content="R1.2.2">
 <title>墨印 · MoInk</title>
 <style>
 /* ===== Cropper.js v1.6.2 | MIT | https://github.com/fengyuanchen/cropperjs ===== */
@@ -421,15 +421,38 @@ details summary{ cursor:pointer; font-weight:600; font-size:14px; color:var(--in
       <label>屏幕</label>
       <select id="panelSel"><option value="0">A0</option><option value="1">A1</option></select>
     </div>
-    <div class="row" id="a1Row" style="display:none">
-      <label>A1 驱动</label>
-      <select id="a1Sel">
-        <option value="1">768×552 顺序</option>
-        <option value="2">方案A 原生800×600</option>
-      </select>
-    </div>
     <div class="row"><label><input type="checkbox" id="hflip"> 左右镜像</label></div>
     <div class="row"><button class="mini" id="savePanel">保存</button><span class="savestate" id="panelmsg"></span></div>
+    </details>
+
+    <details>
+      <summary>GPIO 设置</summary>
+    <div class="row">
+      <label>接法</label>
+      <select id="gpioPreset">
+        <option value="0">默认</option>
+        <option value="1">排线</option>
+        <option value="2">整合板</option>
+        <option value="3">自定义</option>
+      </select>
+    </div>
+    <div id="gpioCustom" style="display:none">
+      <div class="hint" style="margin:2px 0 6px">逐项选引脚：已被其它项占用的 IO 会自动从下拉里去掉。电池 ADC 只能选 GPIO0–4，唤醒键只能选 GPIO0–5。</div>
+      <div class="row"><label>电池 ADC</label><select class="gpin"></select></div>
+      <div class="row"><label>唤醒键</label><select class="gpin"></select></div>
+      <div class="row"><label>SCK</label><select class="gpin"></select></div>
+      <div class="row"><label>MOSI</label><select class="gpin"></select></div>
+      <div class="row"><label>CS</label><select class="gpin"></select></div>
+      <div class="row"><label>DC</label><select class="gpin"></select></div>
+      <div class="row"><label>RST</label><select class="gpin"></select></div>
+      <div class="row"><label>BUSY</label><select class="gpin"></select></div>
+    </div>
+    <div class="row">
+      <button class="mini" id="saveGpio">保存</button>
+      <button class="mini" id="saveGpioReboot">保存并重启</button>
+      <span class="savestate" id="gpiomsg"></span>
+    </div>
+    <div class="hint">引脚改动<b>需重启才生效</b>（SPI 总线按引脚在启动时初始化）。改错导致屏不亮时，按住唤醒键 5 秒可恢复出厂。</div>
     </details>
 
     <details>
@@ -494,20 +517,10 @@ var PANEL = { id: 0, name: "A0", w: 768, h: 552 };
 /* R1.1.2（FB-013）：设备帧几何由「屏幕 + A1 驱动模式」共同决定——
    A0 / A1(默认 768×552 顺序) = 768×552；A1(原生 800×600 对照档) = 800×600。
    编辑空间恒为设备帧顺时针转 90°（EW x EH = h x w），见 applyPanelGeom()。 */
-var A1MODE = 1;        /* A1 驱动模式：1 = 768×552 顺序（默认正解）/ 2 = 方案A 原生800×600 */
-var A1MODE_MAX = 2;
-/* 设备帧格式契约版本（/api/info.api）三态：0 = 未连设备 / 能力未知（本地离线打开
-   页面时 fetch 失败），1 = 旧固件（发不了 800x600 帧），2 = fw R1.1.0 及以后。
-   FB-011（R1.1.1）：未连设备时按「可用」乐观显示（离线预览是本项目主力工作流），
-   连上设备后一律以真实 api 严格收紧。 */
+/* 设备帧格式契约版本（/api/info.api）：0 = 未连设备 / 能力未知（本地离线打开页面时
+   fetch 失败），>=2 = fw R1.1.0 及以后。连上设备后以真实 api 为准。 */
 var DEV_API = 0;
-function apiAtLeast2(){ return DEV_API === 0 || DEV_API >= 2; }
 var EW = 552, EH = 768;
-/* 屏幕 + A1 模式 -> 设备帧几何。 */
-function panelGeomOf(panelId, a1Mode){
-  if (panelId === 1 && apiAtLeast2() && +a1Mode === 2) return { w: 800, h: 600 };
-  return { w: 768, h: 552 };
-}
 /* GEOM_SRC = 当前已存文字/留白坐标所依据的编辑空间几何（竖屏）。 */
 var GEOM_SRC = { w: 552, h: 768 };
 function migrateGeomTo(nw, nh){
@@ -528,13 +541,13 @@ function migrateGeomTo(nw, nh){
   saveCfg();
   return true;
 }
-/* 应用「屏幕 + A1 模式」：切换 PANEL 与编辑空间；几何变了则按比例迁移已存工程
-   （坐标/字号/换行宽/留白），保证版面意图不变。返回是否发生了几何切换。 */
-function applyPanelGeom(panelId, a1Mode){
-  var g = panelGeomOf(panelId, a1Mode);
-  if (PANEL.w === g.w && PANEL.h === g.h){ PANEL.id = +panelId; return false; }
-  PANEL.id = +panelId; PANEL.w = g.w; PANEL.h = g.h;
-  EW = g.h; EH = g.w;
+/* 应用屏幕：切换 PANEL 与编辑空间；几何变了则按比例迁移已存工程（坐标/字号/
+   换行宽/留白），保证版面意图不变。返回是否发生了几何切换。
+   R1.2.2：A1 只保留 768×552 顺序档，A0 / A1 几何一致，故不再有分支。 */
+function applyPanelGeom(panelId){
+  if (PANEL.w === 768 && PANEL.h === 552){ PANEL.id = +panelId; return false; }
+  PANEL.id = +panelId; PANEL.w = 768; PANEL.h = 552;
+  EW = 552; EH = 768;
   migrateGeomTo(EW, EH);
   return true;
 }
@@ -1183,8 +1196,8 @@ function frameWithHeader(payload){
   var hdr = new Uint8Array(16);
   var len = payload.length;
   var crc = crc16(payload);
-  /* hdr[2]：1 = 768x552 载荷；2 = A1 原生 800x600 载荷（固件 api 2 起接受） */
-  hdr[0] = 0xA5; hdr[1] = 0x5A; hdr[2] = (PANEL.w === 800) ? 2 : 1; hdr[3] = PANEL.id;
+  /* hdr[2]：1 = 768x552 载荷（R1.2.2 起唯一几何；原 800x600 对照档已删除）。 */
+  hdr[0] = 0xA5; hdr[1] = 0x5A; hdr[2] = 1; hdr[3] = PANEL.id;
   hdr[4] = (PANEL.w >> 8) & 0xFF; hdr[5] = PANEL.w & 0xFF;
   hdr[6] = (PANEL.h >> 8) & 0xFF; hdr[7] = PANEL.h & 0xFF;
   hdr[8] = (len >>> 24) & 0xFF; hdr[9] = (len >>> 16) & 0xFF;
@@ -2041,10 +2054,7 @@ function refreshInfo(){
     $("conn").classList.toggle("ok", ok);
     if (j.panel) PANEL.name = j.panel;
     if (j.panel === "A1") PANEL.id = 1; else PANEL.id = 0;
-    /* 设备实际在用的 A1 驱动模式决定帧几何（旧固件无 a1_mode -> 恒 768x552）。 */
-    if (j.a1_mode != null) A1MODE = clamp(+j.a1_mode || 1, 1, A1MODE_MAX);
-    if (applyPanelGeom(PANEL.id, A1MODE)) onGeomChanged();
-    syncPanelRows();
+    if (applyPanelGeom(PANEL.id)) onGeomChanged();
   }).catch(function(){ $("conn").textContent = LOCAL_PREVIEW ? "本地预览（未连设备）" : "未连接"; });
 }
 function loadSettings(){
@@ -2056,11 +2066,9 @@ function loadSettings(){
     $("apClearRow").style.display = s.pass_set ? "" : "none";
     $("apClearPw").checked = false;
     $("panelSel").value = String(s.panel);
-    if (s.a1_mode != null) A1MODE = clamp(+s.a1_mode || 1, 1, A1MODE_MAX);
-    $("a1Sel").value = String(A1MODE);
     $("wifiPwrSel").value = String(s.wifi_pwr || 0);
-    syncPanelRows();
-    if (applyPanelGeom(+s.panel, A1MODE)) onGeomChanged();
+    loadGpio(s);
+    if (applyPanelGeom(+s.panel)) onGeomChanged();
     $("hflip").checked = !!s.hflip;
   }).catch(function(){});
 }
@@ -2070,7 +2078,7 @@ function loadSettings(){
    保存中 / ✓ 已保存并生效 / ✗ 未生效 / ✗ 失败原因。
    并且不轻信 "HTTP 200"：保存后回读 /api/settings 逐字段核对，确认真落进了设备。
    热点改名会立刻踢掉客户端（应答可能收不到），所以回读带重试。 */
-var SETT_LABEL = { panel:"屏幕", hflip:"左右镜像", a1_mode:"A1 驱动",
+var SETT_LABEL = { panel:"屏幕", hflip:"左右镜像", gpio_preset:"GPIO 接法",
                    wifi_pwr:"WiFi 功率", sleep_s:"休眠", wake_s:"自动唤醒",
                    ssid:"热点名", pass:"热点密码" };
 function saveState(id, kind, text){
@@ -2103,6 +2111,12 @@ function verifyFields(fields, cb){
         var want = String(fields[k]);
         if (k === "pass"){                       /* 固件不回显密码，只回显「有没有设」 */
           if ((!!s.pass_set) !== (want !== "")) bad.push(k);
+          return;
+        }
+        if (k.indexOf("p_") === 0){      /* GPIO 引脚：固件以 pins[] 数组回显 */
+          var gi = GPIO_KEY.indexOf(k.slice(2));
+          var gv = (gi >= 0 && s.pins) ? String(s.pins[gi]) : "";
+          if (gv !== want) bad.push(k);
           return;
         }
         var got = (s[k] == null) ? "" : String(s[k]);
@@ -2161,12 +2175,6 @@ $("saveAp").addEventListener("click", function(){
     refreshInfo(); loadSettings();
   }, "apmsg");
 });
-function syncPanelRows(){
-  var p = $("panelSel").value;
-  /* A1 驱动模式仅对 A1 且固件 api >= 2 时可调（api=1 的固件没有这套写入路径）。 */
-  var showA1 = (p === "1") && apiAtLeast2();
-  $("a1Row").style.display = showA1 ? "" : "none";
-}
 /* 编辑空间几何切换后的重排：画布尺寸 / 对象手柄 / 预览全部跟着换。 */
 function onGeomChanged(){
   liveBase = null;
@@ -2174,20 +2182,96 @@ function onGeomChanged(){
   try { layoutObjs(); } catch(e){}
   schedulePreview(false);
 }
-$("panelSel").addEventListener("change", syncPanelRows);
+$("panelSel").addEventListener("change", function(){ PANEL.id = +$("panelSel").value; });
 $("savePanel").addEventListener("click", function(){
   var p = $("panelSel").value;
   var fields = { panel: p, hflip: $("hflip").checked ? 1 : 0 };
-  if (p === "1" && apiAtLeast2()) fields.a1_mode = $("a1Sel").value;
-  /* api=1 的旧固件收不了 a1_mode，别谎报「已生效」 */
-  var note = (p === "1" && DEV_API === 1)
-    ? "✓ 已保存（当前固件 api=1 不支持 A1 档位，本次未改驱动模式）" : "";
   postSettings(fields, function(){
     PANEL.id = +p;
-    if (p === "1" && apiAtLeast2()) A1MODE = clamp(+$("a1Sel").value, 1, A1MODE_MAX);
-    if (applyPanelGeom(PANEL.id, A1MODE)) onGeomChanged();
+    if (applyPanelGeom(PANEL.id)) onGeomChanged();
     refreshInfo();
-  }, "panelmsg", note);
+  }, "panelmsg");
+});
+
+/* ---------- GPIO 设置（R1.2.2，FB-GPIO）----------
+   4 档：0 默认 / 1 排线 / 2 整合板 / 3 自定义。自定义时 8 个下拉逐个选引脚；
+   已选过的 IO 自动从其它下拉里去掉；ADC 限 GPIO0–4（ESP32-C3 只有 ADC1 五个通道），
+   唤醒限 GPIO0–5（RTC 深睡唤醒域），其余限安全白名单 0..10（排除固件自用的自锁脚 2）。
+   引脚改动只在启动时初始化，故必须重启生效 → 提供「保存并重启」。 */
+var GPIO_KEY   = ["adc","wake","sck","mosi","cs","dc","rst","busy"];
+var GPIO_WHITE = [0,1,3,4,5,6,7,8,9,10];   /* 0..10 去掉自锁脚 GPIO2 */
+function gpioPool(i){
+  if (i === 0) return [0,1,2,3,4];          /* ADC1_CH0..CH4 = GPIO0..4 */
+  if (i === 1) return [0,1,2,3,4,5];        /* RTC GPIO0..5 */
+  return GPIO_WHITE.slice();
+}
+function gpioSels(){ return Array.prototype.slice.call(document.querySelectorAll("#gpioCustom .gpin")); }
+/* 重算 8 个下拉的选项：先满足 changedIdx（用户刚改的那个），其余依次避让，
+   保证 8 个 IO 两两不重复。 */
+function syncGpioSels(changedIdx){
+  var sels = gpioSels(), n = sels.length;
+  var order = [];
+  if (changedIdx != null && changedIdx >= 0) order.push(changedIdx);
+  for (var i = 0; i < n; i++) if (i !== changedIdx) order.push(i);
+  var taken = {}, val = new Array(n);
+  order.forEach(function(i){
+    var pool = gpioPool(i).map(String), cur = sels[i].value;
+    if (pool.indexOf(cur) >= 0 && !taken[cur]) { val[i] = cur; }
+    else {
+      var free = pool.filter(function(x){ return !taken[x]; });
+      val[i] = free.length ? free[0] : pool[0];
+    }
+    taken[val[i]] = true;
+  });
+  sels.forEach(function(s, i){
+    var others = {};
+    for (var j = 0; j < n; j++) if (j !== i) others[val[j]] = true;
+    var opts = gpioPool(i).map(String).filter(function(x){ return !others[x] || x === val[i]; });
+    if (opts.indexOf(val[i]) < 0) opts.push(val[i]);
+    s.innerHTML = opts.map(function(x){ return '<option value="'+x+'">GPIO'+x+'</option>'; }).join("");
+    s.value = val[i];
+  });
+}
+function toggleGpioCustom(){ $("gpioCustom").style.display = ($("gpioPreset").value === "3") ? "" : "none"; }
+function loadGpio(s){
+  var preset = (s && s.gpio_preset != null) ? +s.gpio_preset : 0;
+  $("gpioPreset").value = String(preset);
+  var pins = (s && s.pins && s.pins.length === 8) ? s.pins.map(Number) : [0,5,4,6,7,1,3,10];
+  gpioSels().forEach(function(sel, i){
+    var v = String(pins[i]);
+    sel.innerHTML = '<option value="'+v+'">GPIO'+v+'</option>';
+    sel.value = v;
+  });
+  syncGpioSels(null);
+  toggleGpioCustom();
+}
+function gpioFields(){
+  var preset = $("gpioPreset").value;
+  var fields = { gpio_preset: preset };
+  if (preset === "3") gpioSels().forEach(function(sel, i){ fields["p_" + GPIO_KEY[i]] = sel.value; });
+  return fields;
+}
+function rebootDevice(){
+  saveState("gpiomsg", "busy", "重启中…");
+  fetch(api("/api/reboot"), { method: "POST" }).then(function(){
+    saveState("gpiomsg", "ok", "✓ 已重启，请用 MoInk 热点重连后刷新");
+  }).catch(function(){
+    /* 重启会立刻断开热点，收不到应答属正常。 */
+    saveState("gpiomsg", "warn", "⚠ 已发出重启指令，设备断连属正常，请稍候重连");
+  });
+}
+gpioSels().forEach(function(sel, i){
+  sel.addEventListener("change", function(){ syncGpioSels(i); });
+});
+$("gpioPreset").addEventListener("change", function(){
+  if ($("gpioPreset").value === "3") syncGpioSels(null);
+  toggleGpioCustom();
+});
+$("saveGpio").addEventListener("click", function(){
+  postSettings(gpioFields(), function(){}, "gpiomsg", "✓ 已保存，重启后生效");
+});
+$("saveGpioReboot").addEventListener("click", function(){
+  postSettings(gpioFields(), function(){ rebootDevice(); }, "gpiomsg", "✓ 已保存，正在重启…");
 });
 
 /* ---------- 维护 ---------- */

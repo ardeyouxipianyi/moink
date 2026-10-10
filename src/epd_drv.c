@@ -13,7 +13,7 @@
  *
  * A0 (768x552) 已在真机验证。800x600 社区 A1 画像旧项目 M6 已移除。
  *
- * A1 (a1_mode 决定 768x552 或 800x600) 是第二套社区适配——InkSight_adapt_HUAWEI_eink
+ * A1 (恒 768x552 顺序直写) 是第二套社区适配——InkSight_adapt_HUAWEI_eink
  *（华为手机壳 A1 版本，EPD_PANEL_38_JD79665_BWRY）。与 A0 同物理玻璃、同可见区
  *（768x552），但控制器握手不同：更长的初始化块（0xAA 解锁、0x01 驱动输出、
  * 0x65/0x84 级联设置）。它还需要长得多的 BUSY 窗口（180 s），且 0x12 后 BUSY
@@ -24,8 +24,11 @@
  * R1.1.2（FB-013）：真机定案可见区恒 768x552、栅极顺序寻址 ⇒ 默认档改为
  * 「768x552 顺序直写」；旧的「两 bank 交错」模型与交错映射路径整体删除。
  * R1.2.0（FB-015）：删除 A1.1 诊断变体与专属画像，A1.1 批次屏直接选 A1。
+ * R1.2.2：真机验收通过后删除 800x600 对照诊断档，A1 只剩 768x552 顺序直写；
+ *         引脚（SPI 六线 + BUSY）改为运行时从 settings_pins() 载入。
  */
 #include "epd_drv.h"
+#include "settings.h"
 
 #include <string.h>
 
@@ -42,37 +45,32 @@ static const char *TAG = "epd";
 #define BUSY_TIMEOUT_REFRESH_MS 45000
 #define BUSY_TIMEOUT_INIT_MS    10000
 #define BUSY_TIMEOUT_LONG_MS    180000  /* A1：这块屏很慢 */
-/* 行缓冲按最宽的合法帧分配：A1 原生 800 宽 -> 200 字节；768 宽的行只需 192。 */
-#define MAX_ROW_BYTES (EPD_A1N_W / 4)  /* 200 */
+/* 行缓冲按最宽的合法帧分配：当前最大帧宽 768 -> 192 字节。 */
+#define MAX_ROW_BYTES (EPD_A1_W / 4)  /* 192 */
 
 const epd_profile_t EPD_PROFILES[EPD_PANEL_COUNT] = {
     [EPD_PANEL_A0] = { EPD_A0_W, EPD_A0_H, EPD_A0_W / 4 * EPD_A0_H, -1, 0 },
     [EPD_PANEL_A1] = { EPD_A1_W, EPD_A1_H, EPD_A1_W / 4 * EPD_A1_H,  0, 1 },
 };
 
-/* A1 原生画像：a1_mode 2（对照档）时帧与 TRES 都是 800x600（120000 字节）。 */
-static const epd_profile_t A1_NATIVE_PROF =
-    { EPD_A1N_W, EPD_A1N_H, EPD_A1N_W / 4 * EPD_A1N_H, 0, 1 };
-
 static const epd_profile_t *s_prof = &EPD_PROFILES[EPD_PANEL_A0];
 static epd_panel_t s_panel = EPD_PANEL_A0;
 static int8_t s_lower_y_base = -1;
 static bool s_hflip = false;
-static uint8_t s_a1_mode = EPD_A1_MODE_DEFAULT;   /* A1 驱动模式 1..2，见 epd_drv.h */
 static spi_device_handle_t s_spi;
+
+/* R1.2.2：引脚改为运行时载入（epd_init() 从 settings_pins() 读取）。
+   SPI 六线 + BUSY 缓存在本地，避免每次调用都走 settings_get()。 */
+static uint8_t s_pin_sck, s_pin_mosi, s_pin_cs, s_pin_dc, s_pin_rst, s_pin_busy;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
 /* ---- profile ---- */
 
-/* 依「画像 + A1 模式」选活动画像：A1 的 800x600 对照档换成 A1_NATIVE_PROF。 */
+/* 依画像选活动 profile（R1.2.2 起 A1 只有一种策略，无分支）。 */
 static void profile_apply(void)
 {
-    if (s_panel == EPD_PANEL_A1 && s_a1_mode == EPD_A1_MODE_NATIVE800) {
-        s_prof = &A1_NATIVE_PROF;
-    } else {
-        s_prof = &EPD_PROFILES[s_panel];
-    }
+    s_prof = &EPD_PROFILES[s_panel];
     s_lower_y_base = s_prof->lower_y_base;
 }
 
@@ -99,52 +97,25 @@ const char *epd_panel_name(epd_panel_t panel)
 }
 
 /*
- * 本帧的面板侧几何（TRES / 整窗 / 刷新区间都用它）。由「画像 + A1 模式 +
- * 本帧几何」共同决定，每次显示前由 prepare_geom() 算好——同一份固件因此
- * 既能收 768x552 帧，也能收 A1 原生 800x600 帧。
+ * 本帧的面板侧几何（TRES / 整窗 / 刷新区间都用它）。R1.2.2 起 A1 只有
+ * 768x552 一种帧：面板侧 TRES / 刷新窗恒 768x600（多扫的 48 条栅极落在
+ * 不可见边框区），768x552 帧 1:1 落在栅极 0..551。
  */
 static int s_out_w = EPD_MAX_W;
 static int s_out_h = EPD_MAX_H;
 
 static void prepare_geom(uint16_t fw, uint16_t fh)
 {
-    (void)fh;
+    (void)fw; (void)fh;
     if (s_panel == EPD_PANEL_A1) {
-        /* FB-013 真机定案：可见区恒 768x552，TRES / 刷新窗口恒 768x600
-           （多扫的 48 条栅极落在不可见边框区）。768x552 帧 1:1 落在栅极
-           0..551（默认档）；800x600 帧多出的 32 列 / 48 行落进备用源线与
-           备用栅极（= 被裁切，对照档）。 */
-        s_out_w = (fw >= EPD_A1N_W) ? EPD_A1N_W : EPD_A1_W;
-        s_out_h = EPD_A1N_H;
+        s_out_w = EPD_A1_W;
+        s_out_h = EPD_A1_GATES;
     } else {
         s_out_w = EPD_PROFILES[EPD_PANEL_A0].w;
         s_out_h = EPD_PROFILES[EPD_PANEL_A0].h;
     }
-    ESP_LOGD(TAG, "geom: frame %ux%u -> panel %dx%d", (unsigned)fw, (unsigned)fh,
-             s_out_w, s_out_h);
+    ESP_LOGD(TAG, "geom: panel %dx%d", s_out_w, s_out_h);
 }
-
-/* A1 驱动模式的显示名（日志用）。 */
-static const char *a1_mode_name(uint8_t v)
-{
-    switch (v) {
-    case EPD_A1_MODE_SEQ552:    return "seq 768x552 (default, 1:1 filled)";
-    case EPD_A1_MODE_NATIVE800: return "native 800x600 (cropped)";
-    default:                     return "?";
-    }
-}
-
-void epd_set_a1_mode(uint8_t v)
-{
-    /* 越界值回落到默认档。 */
-    if (v < EPD_A1_MODE_SEQ552 || v > EPD_A1_MODE_NATIVE800) v = EPD_A1_MODE_DEFAULT;
-    if (v == s_a1_mode) return;
-    s_a1_mode = v;
-    if (s_panel == EPD_PANEL_A1) profile_apply();
-    ESP_LOGI(TAG, "A1 drive mode = %u (%s)", (unsigned)v, a1_mode_name(v));
-}
-
-uint8_t epd_get_a1_mode(void) { return s_a1_mode; }
 
 epd_panel_t epd_get_panel(void) { return s_panel; }
 
@@ -152,9 +123,8 @@ const epd_profile_t *epd_profile(void) { return s_prof; }
 
 void epd_set_hflip(bool on)
 {
-    /* 该覆盖只对线性 A1 控制器有意义（A0 的 180° 缓冲契约已含镜像，再翻即颠倒）。
-     * 生效范围：2 NATIVE800 对照档（勾上 = 整行镜像，真机正向）。
-     * 1 SEQ552 默认档行内固定整行镜像，不读本开关。 */
+    /* R1.2.2：唯一生效档（A1 800x600 对照档）已删除，本开关当前无生效对象；
+       保留仅为兼容既有 NVS 键与调用点。A0 仍按 180° 缓冲契约处理。 */
     if (!s_prof->linear) on = false;
     s_hflip = on;
     ESP_LOGI(TAG, "horizontal flip = %d", (int)on);
@@ -177,34 +147,34 @@ static esp_err_t spi_tx(const uint8_t *data, size_t len)
 static esp_err_t epd_cmd(uint8_t cmd, const uint8_t *data, size_t len)
 {
     esp_err_t err;
-    gpio_set_level(EPD_PIN_DC, 0);
-    gpio_set_level(EPD_PIN_CS, 0);
+    gpio_set_level(s_pin_dc, 0);
+    gpio_set_level(s_pin_cs, 0);
     err = spi_tx(&cmd, 1);
     if (err == ESP_OK && len > 0) {
-        gpio_set_level(EPD_PIN_DC, 1);
+        gpio_set_level(s_pin_dc, 1);
         err = spi_tx(data, len);
     }
-    gpio_set_level(EPD_PIN_CS, 1);
+    gpio_set_level(s_pin_cs, 1);
     return err;
 }
 
 static void epd_reset(void)
 {
     vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_level(EPD_PIN_RST, 0);
+    gpio_set_level(s_pin_rst, 0);
     vTaskDelay(pdMS_TO_TICKS(40));
-    gpio_set_level(EPD_PIN_RST, 1);
+    gpio_set_level(s_pin_rst, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 static int epd_wait_busy(uint32_t timeout_ms)
 {
     int64_t t0 = now_ms();
-    while (gpio_get_level(EPD_PIN_BUSY) == 0) {   /* LOW = 忙 */
+    while (gpio_get_level(s_pin_busy) == 0) {   /* LOW = 忙 */
         vTaskDelay(pdMS_TO_TICKS(10));
         if (now_ms() - t0 > (int64_t)timeout_ms) {
             ESP_LOGE(TAG, "BUSY timeout (%lu ms), BUSY=%d",
-                     (unsigned long)timeout_ms, gpio_get_level(EPD_PIN_BUSY));
+                     (unsigned long)timeout_ms, gpio_get_level(s_pin_busy));
             return -1;
         }
     }
@@ -257,7 +227,7 @@ static void epd_panel_init_a1(void)
     EPD_C1(0x50, 0x3F);                 /* VCOM */
 
     int h_active = s_out_h;             /* prepare_geom() 定：A1 恒 600 条栅极 */
-    int tres_w = s_out_w;               /* 768（交错帧）或 800（原生帧） */
+    int tres_w = s_out_w;               /* 恒 768（A1 顺序直写） */
     uint8_t tres[4] = { (uint8_t)(tres_w >> 8), (uint8_t)(tres_w & 0xFF),
                         (uint8_t)(h_active >> 8), (uint8_t)(h_active & 0xFF) };
     epd_cmd(0x61, tres, 4);             /* TRES */
@@ -313,62 +283,13 @@ static void row_mirror(uint8_t *dst, const uint8_t *src, int row_bytes, bool fli
 }
 
 /*
- * A1 批次的行内变换（只给 2 NATIVE800 对照档用）：FB-013 真机对照确认，
- * 勾「左右镜像」走整行镜像才正向 —— 即 A1 源线顺序与 A0 **同向**，
- * 行内需要整行镜像（FB-010 的"不作变换才正向"结论已被真机推翻）。
- * 1 SEQ552 默认档不走这里：它在自己的写入函数里固定整行镜像。
- */
-static void row_a1(uint8_t *dst, const uint8_t *src, int row_bytes)
-{
-    if (s_hflip) {
-        row_mirror(dst, src, row_bytes, false);
-        return;
-    }
-    memcpy(dst, src, row_bytes);
-}
-
-/*
- * A1 顺序直写 · 原生 800x600（a1_mode 2 = 对照档）：一个整窗，逐行自上而下
- * 1:1 直写，栅极号 = 行号。帧行自下而上存储（180° 契约），故面板第 j 行取
- * 缓冲第 fh-1-j 行。本屏可见区恒 768x552（FB-013 真机定案），此档多出的
- * 右 32 列 / 下 48 行落进备用源线与备用栅极 = 被裁掉，仅作对照。
- */
-static int epd_write_frame_a1_seq(const uint8_t *buf, int fw, int fh)
-{
-    static uint8_t row[MAX_ROW_BYTES];
-    const int RB = fw / 4;
-    uint8_t z = 0x00;
-
-    epd_cmd(0x04, &z, 0);                       /* 上电（同参考驱动顺序） */
-    if (epd_wait_busy(BUSY_TIMEOUT_REFRESH_MS) != 0) return -1;
-
-    epd_set_window(fw, 0, fh - 1);
-    epd_cmd(0x10, NULL, 0);                     /* 写 RAM */
-
-    gpio_set_level(EPD_PIN_DC, 1);
-    gpio_set_level(EPD_PIN_CS, 0);
-    esp_err_t err = ESP_OK;
-    for (int j = 0; j < fh && err == ESP_OK; j++) {
-        row_a1(row, buf + (size_t)(fh - 1 - j) * RB, RB);
-        err = spi_tx(row, RB);
-    }
-    gpio_set_level(EPD_PIN_CS, 1);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI tx failed: %s", esp_err_to_name(err));
-        return -1;
-    }
-    return 0;
-}
-
-/*
- * A1 顺序直写 · 552（a1_mode 1 = ★默认正解，FB-013）：
+ * A1 顺序直写 · 552（★唯一路径，FB-013 真机定案）：
  * 帧 768x552 -> 写入窗口 (0..767, 0..551) -> 单次 0x10 连发 552 行 x 192 B，
- * 栅极号 = 行号（顺序 0..551）。与 2 NATIVE800 共用同一套已被真机验证可用的
- * 写入路径（整窗 + 单次 0x10 + 整帧 CS 包络），只把几何换成可见区尺寸，
- * 因此 1:1 落在 552 条可见栅极上：不裁切、不重采样、无白边。
+ * 栅极号 = 行号（顺序 0..551）。整窗 + 单次 0x10 + 整帧 CS 包络，
+ * 1:1 落在 552 条可见栅极上：不裁切、不重采样、无白边。
  *
  * 行内固定整行镜像：真机对照确认这块屏只有镜像后才正向（与 A0 同向）。
- * 本档不读 s_hflip ——「左右镜像」勾选框只保留给 2 NATIVE800 对照档。
+ * 本档不读 s_hflip。
  */
 static int epd_write_frame_a1_seq552(const uint8_t *buf)
 {
@@ -382,15 +303,15 @@ static int epd_write_frame_a1_seq552(const uint8_t *buf)
     epd_set_window(W, 0, H - 1);                /* 窗口 (0..767, 0..551) */
     epd_cmd(0x10, NULL, 0);                     /* 写 RAM */
 
-    gpio_set_level(EPD_PIN_DC, 1);
-    gpio_set_level(EPD_PIN_CS, 0);
+    gpio_set_level(s_pin_dc, 1);
+    gpio_set_level(s_pin_cs, 0);
     esp_err_t err = ESP_OK;
     for (int j = 0; j < H && err == ESP_OK; j++) {
         /* 缓冲自下而上存储（180° 契约）：面板第 j 行取缓冲第 H-1-j 行。 */
         row_mirror(row, buf + (size_t)(H - 1 - j) * RB, RB, false);
         err = spi_tx(row, RB);
     }
-    gpio_set_level(EPD_PIN_CS, 1);
+    gpio_set_level(s_pin_cs, 1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SPI tx failed: %s", esp_err_to_name(err));
         return -1;
@@ -414,10 +335,7 @@ static int epd_write_frame_2bpp(const uint8_t *buf)
     if (epd_wait_busy(BUSY_TIMEOUT_REFRESH_MS) != 0) return -1;
 
     if (s_prof->linear) {
-        /* 按「本帧几何」而非模式选路径：
-           800x600 帧走对照档，768x552 帧走默认正解档。 */
-        if (s_out_w >= EPD_A1N_W)
-            return epd_write_frame_a1_seq(buf, EPD_A1N_W, EPD_A1N_H);
+        /* A1 只有 768x552 顺序直写一种路径（R1.2.2）。 */
         return epd_write_frame_a1_seq552(buf);
     }
 
@@ -433,10 +351,10 @@ static int epd_write_frame_2bpp(const uint8_t *buf)
         epd_cmd(0x10, &z, 0);                   /* 写 RAM */
 
         row_mirror(row, src, row_bytes, s_hflip);
-        gpio_set_level(EPD_PIN_DC, 1);
-        gpio_set_level(EPD_PIN_CS, 0);
+        gpio_set_level(s_pin_dc, 1);
+        gpio_set_level(s_pin_cs, 0);
         esp_err_t err = spi_tx(row, row_bytes);
-        gpio_set_level(EPD_PIN_CS, 1);
+        gpio_set_level(s_pin_cs, 1);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "SPI tx failed: %s", esp_err_to_name(err));
             return -1;
@@ -493,21 +411,29 @@ void epd_panel_deep_sleep(void)
 
 int epd_init(void)
 {
+    const pin_cfg_t *p = settings_pins();
+    s_pin_sck  = p->v[PIN_IDX_SCK];
+    s_pin_mosi = p->v[PIN_IDX_MOSI];
+    s_pin_cs   = p->v[PIN_IDX_CS];
+    s_pin_dc   = p->v[PIN_IDX_DC];
+    s_pin_rst  = p->v[PIN_IDX_RST];
+    s_pin_busy = p->v[PIN_IDX_BUSY];
+
     gpio_config_t out = {
-        .pin_bit_mask = (1ULL << EPD_PIN_CS) | (1ULL << EPD_PIN_DC) |
-                        (1ULL << EPD_PIN_RST),
+        .pin_bit_mask = (1ULL << s_pin_cs) | (1ULL << s_pin_dc) |
+                        (1ULL << s_pin_rst),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&out));
-    gpio_set_level(EPD_PIN_RST, 1);
-    gpio_set_level(EPD_PIN_CS, 1);
-    gpio_set_level(EPD_PIN_DC, 0);
+    gpio_set_level(s_pin_rst, 1);
+    gpio_set_level(s_pin_cs, 1);
+    gpio_set_level(s_pin_dc, 0);
 
     gpio_config_t in = {
-        .pin_bit_mask = (1ULL << EPD_PIN_BUSY),
+        .pin_bit_mask = (1ULL << s_pin_busy),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -516,9 +442,9 @@ int epd_init(void)
     ESP_ERROR_CHECK(gpio_config(&in));
 
     spi_bus_config_t bus = {
-        .mosi_io_num = EPD_PIN_MOSI,
+        .mosi_io_num = s_pin_mosi,
         .miso_io_num = -1,
-        .sclk_io_num = EPD_PIN_SCK,
+        .sclk_io_num = s_pin_sck,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = 4096,
@@ -542,8 +468,8 @@ int epd_init(void)
     }
 
     ESP_LOGI(TAG, "EPD ready: SPI2 %d Hz, SCK=%d MOSI=%d CS=%d DC=%d RST=%d BUSY=%d",
-             SPI_HZ, EPD_PIN_SCK, EPD_PIN_MOSI, EPD_PIN_CS,
-             EPD_PIN_DC, EPD_PIN_RST, EPD_PIN_BUSY);
+             SPI_HZ, s_pin_sck, s_pin_mosi, s_pin_cs,
+             s_pin_dc, s_pin_rst, s_pin_busy);
     return 0;
 }
 
@@ -557,7 +483,7 @@ static int epd_cycle(const uint8_t *frame)
     for (int attempt = 0; attempt < 3; attempt++) {
         int64_t t0;
         ESP_LOGI(TAG, "display attempt %d/3 (BUSY=%d)", attempt + 1,
-                 gpio_get_level(EPD_PIN_BUSY));
+                 gpio_get_level(s_pin_busy));
 
         if (epd_panel_init() != 0) continue;
 
@@ -581,8 +507,8 @@ static int epd_cycle(const uint8_t *frame)
 int epd_display_2bpp_wh(const uint8_t *frame, uint16_t w, uint16_t h)
 {
     prepare_geom(w, h);
-    ESP_LOGI(TAG, "display %ux%u -> panel %dx%d, A1 mode %u",
-             (unsigned)w, (unsigned)h, s_out_w, s_out_h, (unsigned)s_a1_mode);
+    ESP_LOGI(TAG, "display %ux%u -> panel %dx%d",
+             (unsigned)w, (unsigned)h, s_out_w, s_out_h);
     return epd_cycle(frame);
 }
 
@@ -592,18 +518,12 @@ int epd_display_2bpp(const uint8_t *frame)
 }
 
 /*
- * 帧几何校验：A0 只认自身画像尺寸；A1 两种几何都收
- * （768x552 = 默认档 SEQ552，800x600 = 对照档 NATIVE800）。
+ * 帧几何校验：A0 / A1 都只认各自的 768x552 画像尺寸。
+ * （R1.2.2 起 A1 的 800x600 对照档与接收路径已删除。）
  */
 bool epd_frame_geom_ok(uint16_t w, uint16_t h, uint32_t len)
 {
-    if (w == s_prof->w && h == s_prof->h && len == s_prof->buf_len) return true;
-    if (s_panel != EPD_PANEL_A1) return false;
-    if (w == EPD_A1_W && h == EPD_A1_H &&
-        len == (uint32_t)(EPD_A1_W / 4) * EPD_A1_H) return true;
-    if (w == EPD_A1N_W && h == EPD_A1N_H &&
-        len == (uint32_t)(EPD_A1N_W / 4) * EPD_A1N_H) return true;
-    return false;
+    return (w == s_prof->w && h == s_prof->h && len == s_prof->buf_len);
 }
 
 int epd_clear_cycles(int cycles)
@@ -613,9 +533,9 @@ int epd_clear_cycles(int cycles)
     if (cycles < 1) cycles = 1;
     if (cycles > 4) cycles = 4;
 
-    /* 清理没有帧几何可参考：A1 按控制器原生 800x600 清整屏（覆盖全部栅极），
+    /* 清理没有帧几何可参考：A1 按面板侧几何（768x600，覆盖全部栅极）清整屏，
        其余画像按自身尺寸。 */
-    prepare_geom((s_panel == EPD_PANEL_A1) ? EPD_A1N_W : s_prof->w, s_prof->h);
+    prepare_geom(s_prof->w, s_prof->h);
 
     for (int c = 0; c < cycles; c++) {
         /* 黑/白交替，两种色素极端都得到锻炼 */
@@ -632,10 +552,10 @@ int epd_clear_cycles(int cycles)
             int tx_bytes = w / 4;
             epd_set_window(w, 0, h_active - 1);
             epd_cmd(0x10, NULL, 0);
-            gpio_set_level(EPD_PIN_DC, 1);
-            gpio_set_level(EPD_PIN_CS, 0);
+            gpio_set_level(s_pin_dc, 1);
+            gpio_set_level(s_pin_cs, 0);
             for (int j = 0; j < h_active; j++) spi_tx(row, tx_bytes);
-            gpio_set_level(EPD_PIN_CS, 1);
+            gpio_set_level(s_pin_cs, 1);
         } else {
             uint8_t z = 0x00;
             for (int j = 0; j < H; j++) {
@@ -644,10 +564,10 @@ int epd_clear_cycles(int cycles)
                 if (ys > H - 1) ys = H - 1;
                 epd_set_window(s_prof->w, ys, ys);
                 epd_cmd(0x10, &z, 0);
-                gpio_set_level(EPD_PIN_DC, 1);
-                gpio_set_level(EPD_PIN_CS, 0);
+                gpio_set_level(s_pin_dc, 1);
+                gpio_set_level(s_pin_cs, 0);
                 spi_tx(row, row_bytes);
-                gpio_set_level(EPD_PIN_CS, 1);
+                gpio_set_level(s_pin_cs, 1);
             }
             epd_set_window(s_prof->w, 0, H - 1);
         }

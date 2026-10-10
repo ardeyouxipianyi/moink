@@ -1,6 +1,9 @@
 # 墨印 · MoInk — 版本更新记录（CHANGELOG）
 
-> **★ 当前已发布基线 = R1.2.1**（2026-10-04，captive portal 修复 + WiFi 默认功率调整 + 裁剪更丝滑 + 文本框问题修复）。
+> **★ 当前开发中 = R1.2.2**（2026-10-10，删除 A1 驱动二级菜单 + GPIO 接法可配 + MOS 自锁 IO；**尚未打 tag / 发 Release**）。
+> **★ R1.2.1**（2026-10-04，captive portal 修复 + WiFi 默认功率调整 + 裁剪更丝滑 + 文本框问题修复）
+> 已合入 main，但**未打 tag / 未发 Release**（决定暂不补发）。
+> **★ 最新已发布 Release = R1.2.0**（tag `R1.2.0`，2026-09-24）。
 > **★ R1.2.0**（tag `R1.2.0`，2026-09-24；版本号合并 + 统一升级入口 + 强制重置 + 清除过时代码 + 分区表新增 store 存储分区）。
 > **★ R1.2.0 起 tag 命名随版本号合并简化为单一 `R1.x.y`**（不再用 `fw-R1.x.y_page-R1.x.y` 双号）。
 > **⚠️ 升级到 R1.2.0 必须线刷，不能 OTA**：本版分区表有变（新增 store 存储分区，FB-017 第一部分），
@@ -31,6 +34,62 @@
 ```
 
 （R1.2.0 起只有单一版本号；此前的历史条目保留 `fw + page` 双号写法，不再改写）
+
+---
+
+## [R1.2.2] 2026-10-10 —— 屏幕设置精简 + GPIO 接法可配 + MOS 自锁 IO + 取消升级强制重置
+
+### 新增
+- **GPIO 设置**：SPI 六线（SCK/MOSI/CS/DC/RST/BUSY）与电池 ADC、唤醒键改为**运行时可配**，
+  提供四档 —— `默认`（SCK4/MOSI6/CS7/DC1/RST3/BUSY10，唤醒5，ADC0）、
+  `排线`（7/10/6/4/3/1，唤醒5）、`整合板`（4/3/5/6/7/10，唤醒1）、`自定义`。
+  自定义由页面逐个选 IO（已选 IO 自动从其它下拉移除；ADC 限 GPIO0–4、唤醒限 GPIO0–5）；
+  固件侧 `pin_cfg_valid()` 做白名单（仅 GPIO0..10）+ 去重 + 避开自锁脚校验，非法直接 400。
+- **MOS 一键开机自锁脚 GPIO2**：`app_main()` 第一件事就把 GPIO2 配置为输出并拉高
+  （早于 NVS / WiFi / 屏初始化）；深睡前 `gpio_hold_en()` + `gpio_deep_sleep_hold_en()`
+  锁存电平，避免数字域掉电导致外部自锁电路断供。
+- **`POST /api/reboot`**：改 GPIO 后由页面「保存并重启」调用；先应答再重启。
+
+### 修改
+- **屏幕设置去掉「A1 驱动」二级菜单**：A1 真机验收通过后只保留 768×552 顺序直写一种策略，
+  800×600 对照诊断档**连同固件接收路径一并删除**（`A1_NATIVE_PROF` / `row_a1()` /
+  `epd_write_frame_a1_seq()` / `epd_set_a1_mode()` / `a1_mode_name()` 全删）。
+  `epd_drv.c` 由 24,490 B 缩至约 20,850 B。
+- **引脚由编译期宏改为运行时读取**：`EPD_PIN_*` 宏删除，改由 `settings_pins()` 提供；
+  `epd_drv.c` / `power.c` 在 `epd_init()` / `power_init()` 时载入。ADC 通道按引脚推导
+  （GPIO0..4 = ADC1_CH0..CH4）。
+- **接口字段调整**：`/api/info` 与 `/api/settings` 去掉 `a1_mode`；`/api/info` 增 `gpio_preset`，
+  `/api/settings` 增 `gpio_preset` + `pins[8]` 数组。
+- **撤销「每次固件升级强制重置设置」**：`settings_reset_for_upgrade()` 改为**只清理本版
+  已废弃的键**（`a1_mode` / `a11_var`），`panel` / `hflip` / `wifi_pwr` / `gpio_preset` +
+  8 个引脚键 / `sleep_s` / `wake_s` / `ap_ssid` / `ap_pass` 全部原样保留。
+  全量重置会误伤描述硬件的项 —— A1 设备升级后按 A0 驱动、排线 / 整合板接法按默认引脚启动，
+  用户升级完得重新配一遍，甚至先看到「屏不亮」。
+- 帧几何校验收窄：`epd_frame_geom_ok()` 对 A0 / A1 都只接受 768×552。
+- **电池分压比按硬件改为 100k:100k（×2.0）**：原 470k:100k（×5.7）与实装分压电阻不符，
+  会把电量整体放大 2.85 倍（正常电池被判成超 4600 mV 而显示「未连接」）。
+  `BAT_DIV_NUM` 570 → 200，满量程标定 `BAT_FULLSCALE_MV` 3100 mV 不变，待实机复核。
+
+### 修复
+- 无（本版为功能批）。
+
+### 涉及文件
+- 固件：`src/settings.h`、`src/settings.c`、`src/epd_drv.h`、`src/epd_drv.c`、`src/power.c`、
+  `src/main.c`、`src/version.h`、`src/index_html.h`（重新固化）
+- 页面：`page/index.html`
+- 门禁：`tools/smoke_page.js`（同步断言）、`tools/check_frame.py`（删除 800×600 自测段）
+- 文档：`docs/CONTRACT.md`、`docs/CHANGELOG.md`
+
+### 影响范围与注意事项
+- **api 仍为 2**：帧头格式（16B 头 + 2bpp 载荷）零变动，只是不再接受 `hdr[2]=2` 的 800×600 帧。
+  ⇒ 老版本控制页（会发 800×600）配新固件时，该档传图会被 `400` 拒绝；控制页与固件须同批交付。
+- **改 GPIO 必须重启生效**：SPI 总线与 ADC 通道只在启动时按引脚初始化，运行中不可重映射。
+- **升级不再重置任何用户设置**（含屏型与 GPIO 接法），升级前后行为一致，热点名与密码也保留。
+  唯一例外：**首次**从 ≤R1.2.1 升到 R1.2.2 时 NVS 里还没有 GPIO 键，会落到「默认」档 ——
+  排线 / 整合板接法的设备需进页面选对应档并重启一次（此后升级不再复现）。
+- ⚠️ 自锁脚 GPIO2 是 ESP32-C3 的 **strapping 脚**，外部自锁电路应避免强拉低；
+  深睡期间的 `gpio_hold` 保持能力需真机确认。
+- 回归门禁（全绿）：`check_frame.py` / `smoke_page.js` / `_r110_regress.js` / `check_algo.py`。
 
 ---
 

@@ -5,8 +5,8 @@
  * 在浏览器里合成。没有任何 STA 配网、没有拉图、没有固件端图像处理。
  *
  * 模块分工：
- *   epd_drv   锁定屏驱动（A0/A1，RST=GPIO3），不改
- *   settings  持久化：面板 / 翻转 / 休眠时长 / 自动唤醒 / 热点凭据
+ *   epd_drv   屏驱动（A0/A1；引脚 R1.2.2 起运行时可配）
+ *   settings  持久化：面板 / 翻转 / GPIO 引脚 / 休眠时长 / 自动唤醒 / 热点凭据
  *   netif_ap  纯 SoftAP（默认开放，SSID 默认 MoInk-XXXX）
  *   captive   DNS 劫持 + OS 探测劫持（连上即弹控制页）
  *   frame     帧接收（16B 头 + CRC16 校验）+ 显示触发
@@ -21,6 +21,7 @@
  *   POST /api/upload      ★统一升级入口（自动识别 .bin 固件 / .html 控制页）
  *   POST /api/web/clear   清除已上传控制页，回退内嵌页
  *   POST /api/clear       残影清理
+ *   POST /api/reboot      重启设备（GPIO 设置改后由页面调用）
  *   POST /api/factory     恢复出厂
  */
 #include <string.h>
@@ -153,11 +154,11 @@ static esp_err_t info_handler(httpd_req_t *req)
        api 仍是帧格式契约号，与发布版本号解耦，页面状态栏另起一行显示。 */
     int n = snprintf(buf, sizeof(buf),
         "{\"ver\":\"%s\",\"fw\":\"%s\",\"api\":%d,"
-        "\"panel\":\"%s\",\"a1_mode\":%u,\"heap\":%lu,\"bat_mv\":%d,"
+        "\"panel\":\"%s\",\"gpio_preset\":%u,\"heap\":%lu,\"bat_mv\":%d,"
         "\"sleep_s\":%lu,\"wake_s\":%lu,\"clients\":%d,"
         "\"ssid\":\"%s\",\"uptime\":%lld,\"store_slots\":%d}",
         ota_web_page_version(), MOINK_VERSION, MOINK_API_VERSION,
-        epd_panel_name((epd_panel_t)s->panel), (unsigned)s->a1_mode,
+        epd_panel_name((epd_panel_t)s->panel), (unsigned)s->gpio_preset,
         (unsigned long)esp_get_free_heap_size(), power_battery_mv(),
         (unsigned long)s->sleep_s, (unsigned long)s->wake_s,
         netif_ap_client_count(), netif_ap_ssid(),
@@ -174,12 +175,15 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
 {
     power_activity();
     const moink_settings_t *s = settings_get();
-    char buf[384];
+    char buf[512];
 
     snprintf(buf, sizeof(buf),
-        "{\"panel\":%u,\"hflip\":%u,\"a1_mode\":%u,\"wifi_pwr\":%u,"
+        "{\"panel\":%u,\"hflip\":%u,\"wifi_pwr\":%u,\"gpio_preset\":%u,"
+        "\"pins\":[%u,%u,%u,%u,%u,%u,%u,%u],"
         "\"sleep_s\":%lu,\"wake_s\":%lu,\"ssid\":\"%s\",\"pass_set\":%s}",
-        s->panel, s->hflip, s->a1_mode, s->wifi_pwr,
+        s->panel, s->hflip, s->wifi_pwr, s->gpio_preset,
+        s->pins.v[0], s->pins.v[1], s->pins.v[2], s->pins.v[3],
+        s->pins.v[4], s->pins.v[5], s->pins.v[6], s->pins.v[7],
         (unsigned long)s->sleep_s, (unsigned long)s->wake_s,
         s->ap_ssid, s->ap_pass[0] ? "true" : "false");
 
@@ -217,10 +221,31 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
         settings_set_hflip((uint8_t)atoi(v));
         hflip_changed = true;
     }
-    if (kv_get(body, "a1_mode", v, sizeof(v))) {
-        settings_set_a1_mode((uint8_t)atoi(v));
-        /* 模式会改 A1 的画像几何（768x552 顺序 ↔ 800x600 原生对照），立即生效。 */
-        epd_set_a1_mode(settings_get()->a1_mode);
+    /* GPIO 设置（R1.2.2）：preset 0/1/2 用固定预设，3 = 自定义（须带 8 个引脚）。
+       引脚变更只落盘、不改运行时——SPI 总线与 ADC 通道在启动时按引脚初始化，
+       运行中重映射会把屏驱动搞死；由页面引导用户重启生效。 */
+    bool gpio_changed = false;
+    if (kv_get(body, "gpio_preset", v, sizeof(v))) {
+        uint8_t preset = (uint8_t)atoi(v);
+        if (preset == GPIO_PRESET_CUSTOM) {
+            static const char *PK[PIN_IDX_COUNT] = {
+                "p_adc", "p_wake", "p_sck", "p_mosi", "p_cs", "p_dc", "p_rst", "p_busy"
+            };
+            pin_cfg_t c;
+            bool have = true;
+            for (int i = 0; i < PIN_IDX_COUNT; i++) {
+                char pv[8];
+                if (!kv_get(body, PK[i], pv, sizeof(pv))) { have = false; break; }
+                c.v[i] = (uint8_t)atoi(pv);
+            }
+            if (!have)
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "custom pins incomplete");
+            if (settings_set_gpio(GPIO_PRESET_CUSTOM, &c) != ESP_OK)
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid pin map");
+        } else if (settings_set_gpio(preset, NULL) != ESP_OK) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad gpio preset");
+        }
+        gpio_changed = true;
     }
     if (kv_get(body, "wifi_pwr", v, sizeof(v))) {
         settings_set_wifi_pwr((uint8_t)atoi(v));
@@ -249,7 +274,7 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     if (hflip_changed) epd_set_hflip(settings_get()->hflip != 0);
 
     httpd_resp_set_type(req, "text/plain");
-    esp_err_t err = httpd_resp_sendstr(req, "OK");
+    esp_err_t err = httpd_resp_sendstr(req, gpio_changed ? "OK GPIO" : "OK");
 
     /* 应答已发出，再延迟应用 AP 配置（FB-014②）。 */
     if (ap_changed) {
@@ -297,6 +322,19 @@ static esp_err_t factory_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* R1.2.2：改 GPIO 后由页面调用 —— SPI 总线与 ADC 通道只能在启动时按引脚
+   初始化，因此引脚生效的唯一途径是重启。先应答再重启，避免页面收不到 200。 */
+static esp_err_t reboot_handler(httpd_req_t *req)
+{
+    power_activity();
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "OK rebooting");
+    ESP_LOGW(TAG, "reboot requested by page");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
 /* ---------------- CORS 预检（离线客户端走 file://） ---------------- */
 
 static esp_err_t options_handler(httpd_req_t *req)
@@ -338,6 +376,7 @@ static httpd_handle_t start_server(void)
         { .uri = "/api/settings",   .method = HTTP_POST,   .handler = settings_post_handler,.user_ctx = NULL },
         { .uri = "/api/frame",      .method = HTTP_POST,   .handler = frame_upload_handler, .user_ctx = NULL },
         { .uri = "/api/clear",      .method = HTTP_POST,   .handler = clear_handler,        .user_ctx = NULL },
+        { .uri = "/api/reboot",     .method = HTTP_POST,   .handler = reboot_handler,       .user_ctx = NULL },
         { .uri = "/api/factory",    .method = HTTP_POST,   .handler = factory_handler,      .user_ctx = NULL },
         { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_apple_landing, .user_ctx = NULL },
         { .uri = "/library/test/success.html", .method = HTTP_GET, .handler = captive_apple_landing, .user_ctx = NULL },
@@ -387,10 +426,11 @@ static void idle_monitor_task(void *arg)
 static void button_task(void *arg)
 {
     (void)arg;
+    const gpio_num_t btn = (gpio_num_t)settings_pins()->v[PIN_IDX_WAKE];
     int held = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(50));
-        bool down = (gpio_get_level((gpio_num_t)EPD_PIN_WAKE_BTN) == 0);
+        bool down = (gpio_get_level(btn) == 0);
         if (down) {
             held++;
             if (held == HOLD_RESET_S * 20) {
@@ -412,19 +452,19 @@ static void button_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== MoInk %s | 4-color | ap + unified upgrade ===", MOINK_VERSION);
+    /* ★ MOS 一键开机自锁（R1.2.2）：上电第一件事就拉高，按钮松手后靠它维持
+       供电。必须早于一切耗时初始化，也不依赖任何设置（引脚固定 GPIO2）。 */
+    gpio_config_t self_lock = {
+        .pin_bit_mask = 1ULL << PIN_SELF_LOCK,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&self_lock);
+    gpio_set_level((gpio_num_t)PIN_SELF_LOCK, 1);
 
-    /* 唤醒原因：GPIO = 按键，TIMER = 定时自动唤醒。 */
-    uint32_t wake = power_wakeup_causes();
-    bool auto_wake = (wake & (1u << ESP_SLEEP_WAKEUP_TIMER)) != 0;
-    power_set_auto_wake(auto_wake);
-    if (wake & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
-        ESP_LOGI(TAG, "woken by GPIO%d button", EPD_PIN_WAKE_BTN);
-    } else if (auto_wake) {
-        ESP_LOGI(TAG, "woken by RTC timer (auto wake)");
-    } else if (wake) {
-        ESP_LOGI(TAG, "wakeup bitmap 0x%lx", (unsigned long)wake);
-    }
+    ESP_LOGI(TAG, "=== MoInk %s | 4-color | ap + unified upgrade ===", MOINK_VERSION);
 
     /* NVS */
     esp_err_t err = nvs_flash_init();
@@ -434,6 +474,20 @@ void app_main(void)
     }
 
     settings_init();
+
+    /* 唤醒原因：GPIO = 按键，TIMER = 定时自动唤醒。放在 settings_init() 之后，
+       日志才能打出运行时解析出的唤醒脚。 */
+    uint32_t wake = power_wakeup_causes();
+    bool auto_wake = (wake & (1u << ESP_SLEEP_WAKEUP_TIMER)) != 0;
+    power_set_auto_wake(auto_wake);
+    if (wake & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
+        ESP_LOGI(TAG, "woken by GPIO%u button", settings_pins()->v[PIN_IDX_WAKE]);
+    } else if (auto_wake) {
+        ESP_LOGI(TAG, "woken by RTC timer (auto wake)");
+    } else if (wake) {
+        ESP_LOGI(TAG, "wakeup bitmap 0x%lx", (unsigned long)wake);
+    }
+
     power_init();
     store_init();       /* 轮播存储底座（FB-017 第一部分）：只探测，不写入 */
 
@@ -441,7 +495,6 @@ void app_main(void)
         ESP_LOGE(TAG, "EPD init failed");
     }
     epd_set_panel((epd_panel_t)settings_get()->panel);
-    epd_set_a1_mode(settings_get()->a1_mode);
     epd_set_hflip(settings_get()->hflip != 0);
 
     frame_init();
